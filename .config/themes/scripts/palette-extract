@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
-palette-extract: Extract color palette from images for terminal theming.
+palette-extract: Extract a color palette from an image for terminal + desktop theming.
 
-Replaces pywal with smarter color extraction:
-- Extracts more colors using colorthief
-- Picks 10 most saturated colors for rainbow gradient (g0-g9)
-- Sorts gradient by hue for smooth color progression
-- Maps colors to semantic ANSI roles (red=errors, green=success, etc.)
-- Outputs wal-compatible colors.json
+Wallpaper -> cohesive theme, reasoning in a *perceptual* color space (OKLab/OKLCh)
+rather than HSL:
+
+- Colors are extracted with colorthief (dominance-weighted), then all derivation
+  happens in OKLCh so lightness/chroma steps are perceptually uniform.
+- Surface ramps (crust -> base -> surface -> overlay) step evenly in OKLab L*.
+- Semantic/ANSI colors are ANCHORED to canonical hues (red stays red, green stays
+  green) and only *borrow* chroma from the wallpaper, so an all-blue wallpaper still
+  produces a legible red error color instead of a muddy brick.
+- Body text is neutralized (near-zero chroma) so it never picks up a hue cast.
+- The gradient builder always returns exactly N colors, so low-hue-variety wallpapers
+  (e.g. red-on-black) can't underfill and crash the pipeline.
+
+Outputs a wal-compatible colors.json and, with --generate-theme, the themes-system
+chameleon.json palette (then reruns generate-theme.sh chameleon).
 """
 
 import argparse
@@ -17,7 +26,6 @@ import math
 import os
 import sys
 import tempfile
-from pathlib import Path
 
 try:
     from colorthief import ColorThief
@@ -31,91 +39,180 @@ except ImportError:
     Image = None  # PIL optional, for large image optimization
 
 
+# ---------------------------------------------------------------------------
+# Basic hex <-> rgb
+# ---------------------------------------------------------------------------
+
 def rgb_to_hex(r: int, g: int, b: int) -> str:
-    """Convert RGB values to hex string."""
-    return f"#{r:02x}{g:02x}{b:02x}"
+    return f"#{int(round(r)):02x}{int(round(g)):02x}{int(round(b)):02x}"
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    """Convert hex string to RGB tuple."""
     hex_color = hex_color.lstrip("#")
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+# ---------------------------------------------------------------------------
+# sRGB <-> OKLab <-> OKLCh  (Björn Ottosson's OKLab)
+#
+# We reason about color in OKLCh because equal steps in L*/C* look equal to the
+# eye, unlike HSL. Hue is in degrees (0-360), L in 0..1, C is unbounded but
+# ~0.0-0.37 for in-gamut sRGB.
+# ---------------------------------------------------------------------------
+
+def _srgb_to_linear(c: float) -> float:
+    """c in 0..1 sRGB -> linear."""
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(c: float) -> float:
+    """c in 0..1 linear -> sRGB."""
+    return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+
+def rgb_to_oklab(rgb: tuple) -> tuple[float, float, float]:
+    r, g, b = (_srgb_to_linear(v / 255) for v in rgb)
+
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+
+    l_ = math.copysign(abs(l) ** (1 / 3), l)
+    m_ = math.copysign(abs(m) ** (1 / 3), m)
+    s_ = math.copysign(abs(s) ** (1 / 3), s)
+
+    L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+    a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+    bb = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+    return L, a, bb
+
+
+def _oklab_to_linear_rgb(L: float, a: float, b: float) -> tuple[float, float, float]:
+    l_ = L + 0.3963377774 * a + 0.2158037573 * b
+    m_ = L - 0.1055613458 * a - 0.0638541728 * b
+    s_ = L - 0.0894841775 * a - 1.2914855480 * b
+
+    l = l_ ** 3
+    m = m_ ** 3
+    s = s_ ** 3
+
+    r = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s
+    g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
+    bb = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+    return r, g, bb
+
+
+def _in_gamut(linear_rgb: tuple, eps: float = 1e-4) -> bool:
+    return all(-eps <= c <= 1 + eps for c in linear_rgb)
+
+
+def oklab_to_rgb(L: float, a: float, b: float) -> tuple[int, int, int]:
+    """OKLab -> sRGB 0..255, clamping out-of-gamut channels."""
+    lin = _oklab_to_linear_rgb(L, a, b)
+    out = tuple(int(round(clamp(_linear_to_srgb(clamp(c, 0.0, 1.0)), 0.0, 1.0) * 255)) for c in lin)
+    return out
+
+
+def rgb_to_oklch(rgb: tuple) -> tuple[float, float, float]:
+    L, a, b = rgb_to_oklab(rgb)
+    C = math.hypot(a, b)
+    h = math.degrees(math.atan2(b, a)) % 360
+    return L, C, h
+
+
+def oklch_to_rgb(L: float, C: float, h: float) -> tuple[int, int, int]:
+    """OKLCh -> sRGB 0..255. If (L,C,h) is out of the sRGB gamut, reduce chroma
+    (keeping L and hue) until it fits, so hue and perceived lightness are preserved
+    instead of getting mangled by naive channel clamping."""
+    L = clamp(L, 0.0, 1.0)
+    hr = math.radians(h)
+    ca, cb = math.cos(hr), math.sin(hr)
+
+    def lab_at(chroma):
+        return _oklab_to_linear_rgb(L, chroma * ca, chroma * cb)
+
+    if not _in_gamut(lab_at(C)):
+        lo, hi = 0.0, C
+        for _ in range(24):
+            mid = (lo + hi) / 2
+            if _in_gamut(lab_at(mid)):
+                lo = mid
+            else:
+                hi = mid
+        C = lo
+
+    return oklab_to_rgb(L, C * ca, C * cb)
+
+
+# ---------------------------------------------------------------------------
+# WCAG contrast (unchanged standard: relative luminance in linear sRGB)
+# ---------------------------------------------------------------------------
+
+def get_luminance(r: int, g: int, b: int) -> float:
+    def ch(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+
+def contrast_ratio(c1: tuple, c2: tuple) -> float:
+    l1, l2 = get_luminance(*c1), get_luminance(*c2)
+    lighter, darker = max(l1, l2), min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def oklch_with_contrast(L: float, C: float, h: float, bg_rgb: tuple,
+                        target: float = 4.5) -> tuple[int, int, int]:
+    """Render an OKLCh color, nudging L* until it meets `target` WCAG contrast
+    against bg. Direction is chosen by bg luminance (lighten on dark bg, darken on
+    light bg). Chroma is preserved where the gamut allows."""
+    lighten = get_luminance(*bg_rgb) < 0.5
+    step = 0.015
+    cur_L = L
+    best = oklch_to_rgb(cur_L, C, h)
+    for _ in range(70):
+        rgb = oklch_to_rgb(cur_L, C, h)
+        if contrast_ratio(rgb, bg_rgb) >= target:
+            return rgb
+        cur_L += step if lighten else -step
+        if cur_L >= 1.0 or cur_L <= 0.0:
+            cur_L = clamp(cur_L, 0.0, 1.0)
+            best = oklch_to_rgb(cur_L, C, h)
+            break
+        best = rgb
+    return best
+
+
+def hue_dist(a: float, b: float) -> float:
+    """Circular distance between two hues in degrees (0..180)."""
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+# ---------------------------------------------------------------------------
+# Color extraction (colorthief front-end, dominance-weighted)
+# ---------------------------------------------------------------------------
 
 def rgb_to_hsl(r: int, g: int, b: int) -> tuple[float, float, float]:
-    """Convert RGB (0-255) to HSL (h: 0-360, s: 0-1, l: 0-1)."""
+    """HSL, kept only for the human-readable --verbose dump."""
     h, l, s = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
     return h * 360, s, l
 
 
-def hsl_to_rgb(h: float, s: float, l: float) -> tuple[int, int, int]:
-    """Convert HSL (h: 0-360, s: 0-1, l: 0-1) to RGB (0-255)."""
-    r, g, b = colorsys.hls_to_rgb(h / 360, l, s)
-    return int(r * 255), int(g * 255), int(b * 255)
-
-
-def get_luminance(r: int, g: int, b: int) -> float:
-    """Calculate relative luminance for contrast calculations."""
-    def channel_luminance(c):
-        c = c / 255
-        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
-    return 0.2126 * channel_luminance(r) + 0.7152 * channel_luminance(g) + 0.0722 * channel_luminance(b)
-
-
-def contrast_ratio(color1: tuple, color2: tuple) -> float:
-    """Calculate WCAG contrast ratio between two RGB colors."""
-    l1 = get_luminance(*color1)
-    l2 = get_luminance(*color2)
-    lighter = max(l1, l2)
-    darker = min(l1, l2)
-    return (lighter + 0.05) / (darker + 0.05)
-
-
-def adjust_lightness(rgb: tuple, target_lightness: float) -> tuple[int, int, int]:
-    """Adjust color to target lightness while preserving hue and saturation."""
-    h, s, l = rgb_to_hsl(*rgb)
-    return hsl_to_rgb(h, s, target_lightness)
-
-
-def ensure_contrast(fg_rgb: tuple, bg_rgb: tuple, min_ratio: float = 4.5) -> tuple[int, int, int]:
-    """Adjust foreground color to ensure minimum contrast against background."""
-    if contrast_ratio(fg_rgb, bg_rgb) >= min_ratio:
-        return fg_rgb
-
-    h, s, l = rgb_to_hsl(*fg_rgb)
-    bg_luminance = get_luminance(*bg_rgb)
-
-    # Determine if we need lighter or darker foreground
-    if bg_luminance > 0.5:
-        # Dark foreground on light background
-        for target_l in [x / 100 for x in range(int(l * 100), -1, -5)]:
-            new_rgb = hsl_to_rgb(h, s, target_l)
-            if contrast_ratio(new_rgb, bg_rgb) >= min_ratio:
-                return new_rgb
-    else:
-        # Light foreground on dark background
-        for target_l in [x / 100 for x in range(int(l * 100), 101, 5)]:
-            new_rgb = hsl_to_rgb(h, s, target_l)
-            if contrast_ratio(new_rgb, bg_rgb) >= min_ratio:
-                return new_rgb
-
-    return fg_rgb
-
-
-def extract_colors_with_dominance(image_path: str, color_count: int = 30, verbose: bool = False) -> list[tuple[tuple[int, int, int], float]]:
-    """Extract dominant colors from image with dominance weights.
-
-    Returns list of (rgb_tuple, dominance_weight) where dominance is 0-1,
-    with earlier colors (more dominant) having higher weights.
-    """
-    # Resize large images for faster processing
+def extract_colors_with_dominance(image_path: str, color_count: int = 30,
+                                  verbose: bool = False) -> list[tuple]:
+    """Extract dominant colors with dominance weights (0..1, earlier = more dominant)."""
     process_path = image_path
     temp_file = None
 
     if Image is not None:
         try:
-            img = Image.open(image_path)
-            max_dim = 1600  # Higher res to catch small details
+            img = Image.open(image_path).convert("RGB")
+            max_dim = 1600
             if max(img.size) > max_dim:
                 if verbose:
                     print(f"  Resizing {img.size[0]}x{img.size[1]} -> ", end="")
@@ -124,868 +221,277 @@ def extract_colors_with_dominance(image_path: str, color_count: int = 30, verbos
                 img = img.resize(new_size, Image.LANCZOS)
                 if verbose:
                     print(f"{new_size[0]}x{new_size[1]} for faster processing")
-                # Save to temp file for colorthief
                 temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                 img.save(temp_file.name)
                 process_path = temp_file.name
             img.close()
         except Exception as e:
             if verbose:
-                print(f"  Warning: Could not resize image: {e}")
+                print(f"  Warning: could not resize image: {e}")
 
     try:
         ct = ColorThief(process_path)
-        # quality=5 samples every 5th pixel - better for catching small details
-        # Lower = more accurate but slower
         try:
             palette = ct.get_palette(color_count=color_count, quality=5)
         except Exception:
             palette = ct.get_palette(color_count=color_count, quality=20)
     finally:
-        # Clean up temp file
         if temp_file is not None:
             try:
                 os.unlink(temp_file.name)
             except Exception:
                 pass
 
-    # Assign dominance weights based on position (first = most dominant)
     weighted = []
     for i, color in enumerate(palette):
-        # Exponential decay: first color ~1.0, later colors approach 0
         dominance = 1.0 / (1 + i * 0.3)
-        weighted.append((color, dominance))
-
+        weighted.append((tuple(color), dominance))
     return weighted
 
 
-def extract_colors(image_path: str, color_count: int = 30, verbose: bool = False) -> list[tuple[int, int, int]]:
-    """Extract dominant colors from image using colorthief (without weights)."""
-    return [c for c, _ in extract_colors_with_dominance(image_path, color_count, verbose)]
-
-
-def detect_image_type(colors_weighted: list[tuple]) -> str:
-    """Detect if image is monochrome/low-saturation.
-
-    Returns:
-        "monochrome" if image has few saturated colors
-        "normal" otherwise
-    """
+def detect_image_type(colors_weighted: list) -> str:
+    """"monochrome" if the image has little chroma variety, else "normal"."""
     if not colors_weighted:
         return "monochrome"
-
-    saturations = [rgb_to_hsl(*c)[1] for c, _ in colors_weighted]
-    avg_sat = sum(saturations) / len(saturations)
-    high_sat_count = sum(1 for s in saturations if s > 0.3)
-
-    if avg_sat < 0.15 or high_sat_count < 3:
+    chromas = [rgb_to_oklch(c)[1] for c, _ in colors_weighted]
+    avg_c = sum(chromas) / len(chromas)
+    chromatic = sum(1 for c in chromas if c > 0.04)
+    if avg_c < 0.03 or chromatic < 3:
         return "monochrome"
     return "normal"
 
 
-def select_background(colors_weighted: list[tuple], light_mode: bool = False) -> tuple[int, int, int]:
-    """Select background color - darkest for dark mode, lightest for light mode.
+# ---------------------------------------------------------------------------
+# Background / foreground
+# ---------------------------------------------------------------------------
 
-    Considers both color properties and dominance to find a suitable background.
-    If no suitable color exists, derives one from the best candidate.
-    """
-    # Convert to (color, hsl, dominance)
-    colors_with_data = [(c, rgb_to_hsl(*c), d) for c, d in colors_weighted]
+def select_background(colors_weighted: list, light_mode: bool = False) -> tuple[int, int, int]:
+    """Pick a background: darkest (dark mode) / lightest (light mode) dominant color,
+    with chroma pulled way down and lightness pinned to a comfortable range."""
+    data = [(c, rgb_to_oklch(c), d) for c, d in colors_weighted]
 
     if light_mode:
-        # For light mode: want high lightness, low saturation, some dominance
-        # Score: higher is better
-        def bg_score(hsl, dominance):
-            h, s, l = hsl
-            # Prefer: light, desaturated, dominant
-            return l * 0.5 + (1 - s) * 0.3 + dominance * 0.2
-
-        scored = sorted(colors_with_data, key=lambda x: -bg_score(x[1], x[2]))
-        best = scored[0]
-
-        # If best candidate isn't light enough (l > 0.75), derive one
-        if best[1][2] < 0.75:
-            h, s, l = best[1]
-            return hsl_to_rgb(h, s * 0.3, 0.92)  # Very light, desaturated
-        return best[0]
+        def score(lch, dom):
+            L, C, _ = lch
+            return L * 0.55 + (0.3 - min(C, 0.3)) * 0.5 + dom * 0.15
+        target_L, chroma_cap = 0.95, 0.02
     else:
-        # For dark mode: want low lightness, low saturation, some dominance
-        def bg_score(hsl, dominance):
-            h, s, l = hsl
-            # Prefer: dark, desaturated, dominant
-            # Penalize colors that are too light
-            darkness = 1 - l
-            return darkness * 0.5 + (1 - s) * 0.3 + dominance * 0.2
+        def score(lch, dom):
+            L, C, _ = lch
+            return (1 - L) * 0.55 + (0.3 - min(C, 0.3)) * 0.5 + dom * 0.15
+        target_L, chroma_cap = 0.14, 0.022
 
-        scored = sorted(colors_with_data, key=lambda x: -bg_score(x[1], x[2]))
-        best = scored[0]
-
-        # If best candidate isn't dark enough (l < 0.25), derive one
-        if best[1][2] > 0.25:
-            h, s, l = best[1]
-            # Darken it significantly while keeping a hint of the hue
-            return hsl_to_rgb(h, s * 0.5, 0.08)
-        return best[0]
+    best = max(data, key=lambda x: score(x[1], x[2]))
+    L, C, h = best[1]
+    # Keep a whisper of the image's hue but force it dark/light and near-neutral.
+    L = clamp(L, 0.05, 0.20) if not light_mode else clamp(L, 0.90, 0.98)
+    L = target_L * 0.6 + L * 0.4
+    return oklch_to_rgb(L, min(C, chroma_cap), h)
 
 
-def select_foreground(colors: list[tuple], bg_rgb: tuple, light_mode: bool = False) -> tuple[int, int, int]:
-    """Select foreground color with good contrast against background."""
-    bg_luminance = get_luminance(*bg_rgb)
-
-    # Filter colors by lightness
-    candidates = []
-    for c in colors:
-        h, s, l = rgb_to_hsl(*c)
-        if light_mode:
-            # Dark foreground for light mode
-            if l < 0.35:
-                candidates.append((c, s, l))
-        else:
-            # Light foreground for dark mode
-            if l > 0.65:
-                candidates.append((c, s, l))
-
-    if not candidates:
-        # No good candidates, create one
-        if light_mode:
-            return (30, 30, 30)
-        else:
-            return (220, 220, 220)
-
-    # Pick candidate with best contrast
-    best = None
-    best_contrast = 0
-    for c, s, l in candidates:
-        cr = contrast_ratio(c, bg_rgb)
-        if cr > best_contrast:
-            best_contrast = cr
-            best = c
-
-    # Ensure minimum contrast
-    return ensure_contrast(best, bg_rgb, min_ratio=4.5)
+def select_foreground(bg_rgb: tuple, light_mode: bool = False,
+                      bg_hue: float | None = None) -> tuple[int, int, int]:
+    """Neutralized body text: near-zero chroma (a hint of the bg hue) with a strong
+    contrast guarantee, so text never comes out visibly tinted."""
+    _, _, h = rgb_to_oklch(bg_rgb)
+    if bg_hue is not None:
+        h = bg_hue
+    L = 0.93 if not light_mode else 0.22
+    return oklch_with_contrast(L, 0.012, h, bg_rgb, target=8.0)
 
 
-def is_brown(rgb: tuple[int, int, int]) -> bool:
-    """Detect if a color is truly muddy brown (not orange, rust, or pink).
+# ---------------------------------------------------------------------------
+# Anchored ANSI / semantic colors
+#
+# Canonical OKLCh hues for each terminal color. We keep these hues fixed and only
+# borrow chroma from whatever the wallpaper offers near that hue, so semantics stay
+# recognizable regardless of the image.
+# ---------------------------------------------------------------------------
 
-    Only filter colors that look like dirt/mud - preserve oranges, rusts, pinks.
-    """
-    h, s, l = rgb_to_hsl(*rgb)
-    # True browns are in a narrow hue range (orange-ish, ~15-40°)
-    # with VERY low saturation AND dark
-    in_brown_hue = 15 <= h <= 40
-    very_low_saturation = s < 0.35
-    dark = l < 0.40
+CANON_HUES = {
+    "red": 29.0,
+    "yellow": 100.0,
+    "green": 142.0,
+    "cyan": 195.0,
+    "blue": 264.0,
+    "magenta": 328.0,
+}
+DEFAULT_CHROMA = {
+    "red": 0.15, "yellow": 0.14, "green": 0.15,
+    "cyan": 0.11, "blue": 0.13, "magenta": 0.14,
+}
 
-    return in_brown_hue and very_low_saturation and dark
+
+def borrow_chroma(oklch_colors: list, target_hue: float, default: float,
+                  window: float = 35.0) -> float:
+    """Chroma to use for a canonical hue: the vivid end of what the wallpaper has
+    near that hue (falling back to a sensible default if it has nothing there)."""
+    near = [C for (L, C, h) in oklch_colors
+            if C > 0.03 and hue_dist(h, target_hue) <= window]
+    if not near:
+        return default
+    near.sort()
+    # 75th-percentile-ish: lean toward the vivid colors present, but don't take a
+    # single freak max. Floor at 0.8*default so a hue the wallpaper barely contains
+    # still yields a legibly-colored semantic instead of a washed-out one.
+    picked = near[int(len(near) * 0.75)]
+    return clamp(max(picked, default * 0.8), 0.05, 0.20)
 
 
-def select_gradient_colors(colors_weighted: list[tuple], count: int = 10, verbose: bool = False) -> list[tuple[int, int, int]]:
-    """Select vibrant colors for gradient, prioritizing saturation over dominance.
+def map_ansi_colors(colors_weighted: list, bg_rgb: tuple, light_mode: bool = False,
+                    verbose: bool = False) -> dict:
+    """Anchored ANSI colors 1-6 (normal) and 9-14 (bright). Hues are canonical;
+    chroma is borrowed from the image; lightness targets a legible band and is
+    contrast-clamped against bg."""
+    oklch_colors = [rgb_to_oklch(c) for c, _ in colors_weighted]
 
-    Strategy:
-    - Saturation is king: vibrant colors beat large grey areas
-    - Dominance is a noise filter: helps pick "real" colors over pixel artifacts
-    - Lightness variety: pick both main colors AND their light/dark variants
+    norm_L = 0.66 if not light_mode else 0.52
+    bright_L = 0.80 if not light_mode else 0.42
 
-    Args:
-        colors_weighted: List of ((r,g,b), dominance) tuples
-        count: Number of gradient colors to select
-    """
-    # Convert to (color, hsl, dominance)
-    colors_with_data = [(c, rgb_to_hsl(*c), d) for c, d in colors_weighted]
-
-    # Filter: require minimum saturation (this filters out grey backgrounds)
-    # Allow dark colors if highly saturated (for accent/border colors)
-    # Exclude browns - they're fine for structural colors but not accents
-
-    # Include colors with saturation > 0.08 to catch muted backgrounds
-    filtered = [
-        (c, hsl, d) for c, hsl, d in colors_with_data
-        if hsl[1] > 0.08 and hsl[2] < 0.90 and hsl[2] > 0.08
-        and not is_brown(c)
-    ]
-
-    if len(filtered) < 3:
-        # Relax further
-        filtered = [
-            (c, hsl, d) for c, hsl, d in colors_with_data
-            if hsl[1] > 0.05 and not is_brown(c)
-        ]
-
-    if len(filtered) < 2:
-        filtered = colors_with_data
-
-    if verbose:
-        brown_count = sum(1 for c, _, _ in colors_with_data if is_brown(c))
-        browns_in_filtered = sum(1 for c, _, _ in filtered if is_brown(c))
-        if brown_count > 0:
-            if browns_in_filtered == 0:
-                print(f"  Filtered out {brown_count} brown colors from gradient")
-            else:
-                print(f"  Warning: {browns_in_filtered}/{brown_count} browns included (not enough non-brown colors)")
-
-    # Score: saturation dominant, dominance as noise filter
-    def score(c, hsl, dominance):
-        h, s, l = hsl
-        # Dominance bonus only matters for similarly-saturated colors
-        # A small but saturated color should beat a large grey area
-        # Using log-ish scale for dominance so it doesn't overwhelm saturation
-        dominance_factor = 0.3 + dominance * 0.7  # Range: 0.3 to 1.0
-        base_score = s * dominance_factor
-        # Penalize browns that slip through (last resort fallback)
-        if is_brown(c):
-            base_score *= 0.3
-        return base_score
-
-    # Sort by score (most vibrant first)
-    scored = sorted(filtered, key=lambda x: -score(x[0], x[1], x[2]))
-
-    # Multi-pass selection with per-hue limits:
-    # Pass 1: Pick the most vibrant color from each major hue region
-    # Pass 2-4: Fill remaining slots while respecting max colors per hue
-
-    result = []
-    hue_buckets = {}  # Track which hue regions we've covered
-
-    def get_hue_bucket(h):
-        # 6 major hue regions of 60° each
-        return int(h / 60) % 6
-
-    # Track colors per bucket - limit minor hues, allow more from dominant ones
-    hue_bucket_counts = {}
-    hue_bucket_dominance = {}  # Track total dominance per bucket
-
-    # Calculate dominance per hue bucket from all colors
-    for c, hsl, d in colors_with_data:
-        bucket = get_hue_bucket(hsl[0])
-        hue_bucket_dominance[bucket] = hue_bucket_dominance.get(bucket, 0) + d
-
-    # Buckets with high dominance can have more colors
-    def get_max_for_bucket(bucket):
-        dom = hue_bucket_dominance.get(bucket, 0)
-        if dom > 2.0:  # Highly dominant hue
-            return 3
-        elif dom > 1.0:  # Moderately dominant
-            return 2
-        else:  # Minor hue
-            return 1
-
-    # Pass 1: Get one color per hue bucket (the most vibrant)
-    for c, hsl, d in scored:
-        bucket = get_hue_bucket(hsl[0])
-        if bucket not in hue_buckets:
-            hue_buckets[bucket] = []
-        hue_buckets[bucket].append((c, hsl, d))
-
-    # Pick the top color from each occupied bucket
-    for bucket in sorted(hue_buckets.keys()):
-        if hue_buckets[bucket] and len(result) < count:
-            result.append(hue_buckets[bucket][0][0])
-            hue_bucket_counts[bucket] = hue_bucket_counts.get(bucket, 0) + 1
-
-    # Pass 2: Fill remaining slots with next-best colors (variants)
-    # Prefer colors that add lightness variety to existing hues
-    if len(result) < count:
-        for c, hsl, d in scored:
-            if c in result:
-                continue
-            if len(result) >= count:
-                break
-
-            bucket = get_hue_bucket(hsl[0])
-            # Skip if this hue bucket is already at max
-            if hue_bucket_counts.get(bucket, 0) >= get_max_for_bucket(bucket):
-                continue
-
-            # Check if this adds value - must be sufficiently different
-            dominated_by_similar = False
-            for existing in result:
-                eh, es, el = rgb_to_hsl(*existing)
-                hue_diff = min(abs(hsl[0] - eh), 360 - abs(hsl[0] - eh))
-
-                # If same hue region (within 25°), require large sat/light difference
-                sat_diff = abs(hsl[1] - es)
-                light_diff = abs(hsl[2] - el)
-                if hue_diff < 25 and sat_diff < 0.3 and light_diff < 0.25:
-                    dominated_by_similar = True
-                    break
-
-            if not dominated_by_similar:
-                result.append(c)
-                hue_bucket_counts[bucket] = hue_bucket_counts.get(bucket, 0) + 1
-
-    # Pass 3: If still not enough, take next best but still respect hue limits
-    if len(result) < count:
-        for c, hsl, d in scored:
-            if c in result:
-                continue
-
-            bucket = get_hue_bucket(hsl[0])
-            # Skip if this hue bucket is already at max
-            if hue_bucket_counts.get(bucket, 0) >= get_max_for_bucket(bucket):
-                continue
-
-            # Check hue distance from existing colors
-            dominated = False
-            for existing in result:
-                eh = rgb_to_hsl(*existing)[0]
-                hue_diff = min(abs(hsl[0] - eh), 360 - abs(hsl[0] - eh))
-                if hue_diff < 40:
-                    dominated = True
-                    break
-            if not dominated:
-                result.append(c)
-                hue_bucket_counts[bucket] = hue_bucket_counts.get(bucket, 0) + 1
-                if len(result) >= count:
-                    break
-
-    # Pass 4: Generate variations of existing colors (not new hues)
-    # Create lighter/darker or more/less saturated versions of colors we have
-    # Uses same hue_bucket_counts from above passes
-    if len(result) < count and result:
-        variations = []
-        for c in result:
-            h, s, l = rgb_to_hsl(*c)
-            # Create lighter versions at different levels
-            for delta in [0.15, 0.25, 0.35]:
-                if l + delta <= 0.85:
-                    variations.append(hsl_to_rgb(h, max(0.15, s * 0.85), l + delta))
-            # Create darker versions
-            for delta in [0.12, 0.22]:
-                if l - delta >= 0.15:
-                    variations.append(hsl_to_rgb(h, min(0.9, s * 1.15), l - delta))
-            # Create more/less saturated versions
-            if s < 0.6:
-                variations.append(hsl_to_rgb(h, min(0.75, s + 0.2), l))
-            if s > 0.3:
-                variations.append(hsl_to_rgb(h, max(0.15, s - 0.15), l))
-
-        # Add variations that aren't too similar to existing colors
-        # AND respect per-hue limits
-        for var in variations:
-            if len(result) >= count:
-                break
-            vh, vs, vl = rgb_to_hsl(*var)
-            var_bucket = get_hue_bucket(vh)
-
-            # Skip if this hue bucket is already full
-            if hue_bucket_counts.get(var_bucket, 0) >= get_max_for_bucket(var_bucket):
-                continue
-
-            too_similar = False
-            for existing in result:
-                eh, es, el = rgb_to_hsl(*existing)
-                # Only skip if BOTH saturation AND lightness are similar
-                if abs(vs - es) < 0.12 and abs(vl - el) < 0.12:
-                    too_similar = True
-                    break
-            if not too_similar and not is_brown(var):
-                result.append(var)
-                hue_bucket_counts[var_bucket] = hue_bucket_counts.get(var_bucket, 0) + 1
-
-    # Last resort: create slight variations of existing colors
-    # Still respects per-hue limits to avoid one color dominating
-    dup_idx = 0
-    attempts = 0
-    max_attempts = count * len(result) if result else count
-    while len(result) < count and result and attempts < max_attempts:
-        attempts += 1
-        # Pick a color and shift its lightness slightly
-        base = result[dup_idx % len(result)]
-        h, s, l = rgb_to_hsl(*base)
-        bucket = get_hue_bucket(h)
-
-        # Skip if this hue bucket is full (use higher limit here since it's last resort)
-        if hue_bucket_counts.get(bucket, 0) >= get_max_for_bucket(bucket) + 1:
-            dup_idx += 1
-            continue
-
-        # Alternate between lighter and darker
-        shift = 0.08 * ((dup_idx // len(result)) + 1)
-        if dup_idx % 2 == 0:
-            new_l = min(0.85, l + shift)
-        else:
-            new_l = max(0.15, l - shift)
-        result.append(hsl_to_rgb(h, s, new_l))
-        hue_bucket_counts[bucket] = hue_bucket_counts.get(bucket, 0) + 1
-        dup_idx += 1
-
-    # Analyze hue distribution to detect monochromatic images
-    if result:
-        hues = [rgb_to_hsl(*c)[0] for c in result]
-
-        # Calculate hue variance (accounting for circular nature of hue)
-        # Use the smallest arc containing all hues
-        hues_sorted = sorted(hues)
-        max_gap = 0
-        gap_start = 0
-        for i in range(len(hues_sorted)):
-            next_i = (i + 1) % len(hues_sorted)
-            if next_i == 0:
-                gap = (360 - hues_sorted[i]) + hues_sorted[next_i]
-            else:
-                gap = hues_sorted[next_i] - hues_sorted[i]
-            if gap > max_gap:
-                max_gap = gap
-                gap_start = hues_sorted[next_i]
-
-        hue_spread = 360 - max_gap  # The arc containing all colors
-        is_monochromatic = hue_spread < 90  # Colors span less than 90°
-
+    normals, brights = {}, {}
+    for name, hue in CANON_HUES.items():
+        C = borrow_chroma(oklch_colors, hue, DEFAULT_CHROMA[name])
+        normals[name] = oklch_with_contrast(norm_L, C, hue, bg_rgb, target=3.5)
+        brights[name] = oklch_with_contrast(bright_L, C * 0.92, hue, bg_rgb, target=3.0)
         if verbose:
-            print(f"  Gradient hue spread: {hue_spread:.0f}° ({'monochromatic' if is_monochromatic else 'varied'})")
-
-        # For monochromatic images, keep actual colors - don't generate synthetic ones
-        # The variation pass will fill in gaps with lightness/saturation variations
-        pass
-        # Normalize lightness for visual consistency (keeps same hue, just adjusts brightness)
-        lightnesses = [rgb_to_hsl(*c)[2] for c in result]
-        avg_lightness = sum(lightnesses) / len(lightnesses)
-        target_lightness = max(0.35, min(0.65, avg_lightness))
-
-        normalized = []
-        for c in result:
-            h, s, l = rgb_to_hsl(*c)
-            # Blend lightness toward target (preserves hue, adjusts brightness)
-            new_l = target_lightness * 0.4 + l * 0.6  # 60% original, 40% target
-            new_l = max(0.20, min(0.80, new_l))
-            normalized.append(hsl_to_rgb(h, s, new_l))
-        result = normalized
-
-    # Sort by hue for rainbow effect
-    result.sort(key=lambda c: rgb_to_hsl(*c)[0])
-
-    # Final check: filter out any browns that snuck in during processing
-    final_result = []
-    for c in result[:count]:
-        if is_brown(c):
-            if verbose:
-                h, s, l = rgb_to_hsl(*c)
-                print(f"  Removing brown from final gradient: #{c[0]:02x}{c[1]:02x}{c[2]:02x} h:{h:.0f}°")
-            continue
-        final_result.append(c)
-
-    # If we removed browns or need more colors, create variations (not exact duplicates)
-    # Track bucket counts for final result
-    final_bucket_counts = {}
-    for c in final_result:
-        h = rgb_to_hsl(*c)[0]
-        bucket = int(h / 60) % 6
-        final_bucket_counts[bucket] = final_bucket_counts.get(bucket, 0) + 1
-
-    fill_idx = 0
-    max_fill_attempts = count * 3
-    fill_attempts = 0
-    while len(final_result) < count and final_result and fill_attempts < max_fill_attempts:
-        fill_attempts += 1
-        # Pick a color and create a lightness variation
-        base = final_result[fill_idx % len(final_result)]
-        h, s, l = rgb_to_hsl(*base)
-        bucket = int(h / 60) % 6
-
-        # Skip if this hue bucket is too full (higher limit here as final resort)
-        if final_bucket_counts.get(bucket, 0) >= 5:
-            fill_idx += 1
-            continue
-
-        # Create a variation, not an exact duplicate
-        shift = 0.1 * ((fill_idx // len(final_result)) + 1)
-        if fill_idx % 2 == 0:
-            new_l = min(0.80, l + shift)
-        else:
-            new_l = max(0.20, l - shift)
-        var = hsl_to_rgb(h, s, new_l)
-
-        # Only add if it's not too similar to existing colors
-        too_similar = any(
-            abs(rgb_to_hsl(*existing)[2] - new_l) < 0.08
-            for existing in final_result
-            if abs(rgb_to_hsl(*existing)[0] - h) < 30 or abs(rgb_to_hsl(*existing)[0] - h) > 330
-        )
-        if not too_similar:
-            final_result.append(var)
-            final_bucket_counts[bucket] = final_bucket_counts.get(bucket, 0) + 1
-        fill_idx += 1
-
-    # Re-sort by hue
-    final_result.sort(key=lambda c: rgb_to_hsl(*c)[0])
-
-    return final_result if final_result else result[:count]
-
-
-def find_color_in_hue_range(colors_weighted: list[tuple], hue_min: float, hue_max: float,
-                            wrap: bool = False, min_saturation: float = 0.25,
-                            used_colors: set = None) -> tuple[int, int, int] | None:
-    """Find best color within hue range, prioritizing saturation.
-
-    Saturation is primary (we want vibrant terminal colors).
-    Dominance is secondary (filters noise, breaks ties).
-
-    Args:
-        colors_weighted: List of ((r,g,b), dominance) tuples
-        hue_min: Minimum hue value (0-360)
-        hue_max: Maximum hue value (0-360)
-        wrap: Whether hue range wraps around 0/360
-        min_saturation: Minimum saturation threshold
-        used_colors: Set of already-used colors to skip
-    """
-    if used_colors is None:
-        used_colors = set()
-
-    candidates = []
-    for c, dominance in colors_weighted:
-        if c in used_colors:
-            continue
-        h, s, l = rgb_to_hsl(*c)
-        # Skip desaturated colors
-        if s < min_saturation:
-            continue
-        # Skip very dark or very light colors
-        if l < 0.15 or l > 0.85:
-            continue
-
-        in_range = False
-        if wrap:
-            if h >= hue_min or h < hue_max:
-                in_range = True
-        else:
-            if hue_min <= h < hue_max:
-                in_range = True
-
-        if in_range:
-            # Saturation dominant, dominance as tiebreaker/noise filter
-            # A color needs SOME presence (dominance > 0.1) but saturation wins
-            if dominance < 0.05:  # Filter pixel-level noise
-                continue
-            # Score: saturation primary, small dominance bonus
-            score = s * 0.85 + dominance * 0.15
-            candidates.append((c, score, s, dominance))
-
-    if not candidates:
-        return None
-
-    # Return highest scoring color
-    candidates.sort(key=lambda x: -x[1])
-    return candidates[0][0]
-
-
-def interpolate_color(c1: tuple, c2: tuple, t: float) -> tuple[int, int, int]:
-    """Interpolate between two colors in HSL space."""
-    h1, s1, l1 = rgb_to_hsl(*c1)
-    h2, s2, l2 = rgb_to_hsl(*c2)
-
-    # Handle hue wraparound
-    if abs(h2 - h1) > 180:
-        if h1 > h2:
-            h2 += 360
-        else:
-            h1 += 360
-
-    h = (h1 + t * (h2 - h1)) % 360
-    s = s1 + t * (s2 - s1)
-    l = l1 + t * (l2 - l1)
-
-    return hsl_to_rgb(h, s, l)
-
-
-def map_ansi_colors(colors_weighted: list[tuple], bg_rgb: tuple, light_mode: bool = False,
-                    gradient_colors: list[tuple] = None, verbose: bool = False) -> dict[str, tuple]:
-    """Map extracted colors to ANSI terminal colors by hue ranges.
-
-    Prefers gradient colors when available in the appropriate hue range,
-    since they're already selected for vibrancy.
-
-    Args:
-        colors_weighted: List of ((r,g,b), dominance) tuples
-        bg_rgb: Background color for contrast calculations
-        light_mode: Whether to generate light mode colors
-        gradient_colors: Optional list of gradient RGB tuples to prefer
-        verbose: Whether to print selection details
-    """
-    # Hue ranges for each ANSI color
-    # color1/9: red (330-30, wraps around)
-    # color3/11: yellow (30-90)
-    # color2/10: green (90-150)
-    # color6/14: cyan (150-210)
-    # color4/12: blue (210-270)
-    # color5/13: magenta (270-330)
-
-    hue_ranges = {
-        "red": (330, 30, True),      # wraps
-        "yellow": (30, 90, False),
-        "green": (90, 150, False),
-        "cyan": (150, 210, False),
-        "blue": (210, 270, False),
-        "magenta": (270, 330, False),
-    }
-
-    def in_hue_range(hue: float, hue_min: float, hue_max: float, wrap: bool) -> bool:
-        """Check if hue falls within range (exclusive upper bound to avoid overlaps)."""
-        if wrap:
-            return hue >= hue_min or hue < hue_max
-        return hue_min <= hue < hue_max
-
-    result = {}
-    found_colors = {}
-    used_colors = set()  # Track used colors to avoid duplicates
-
-    # First, try to use gradient colors for each hue range (they're already vibrant)
-    gradient_used = []
-    for name, (hue_min, hue_max, wrap) in hue_ranges.items():
-        found_colors[name] = None
-        if gradient_colors:
-            for gc in gradient_colors:
-                if gc in used_colors:
-                    continue
-                h, s, l = rgb_to_hsl(*gc)
-                # Require decent saturation and appropriate lightness
-                if s > 0.25 and 0.15 < l < 0.85 and in_hue_range(h, hue_min, hue_max, wrap):
-                    found_colors[name] = gc
-                    used_colors.add(gc)
-                    gradient_used.append(name)
-                    break
-
-    if verbose and gradient_used:
-        print(f"  ANSI colors from gradient: {', '.join(gradient_used)}")
-
-    # Fall back to find_color_in_hue_range for any missing colors
-    for name, (hue_min, hue_max, wrap) in hue_ranges.items():
-        if found_colors[name] is None:
-            found_colors[name] = find_color_in_hue_range(
-                colors_weighted, hue_min, hue_max, wrap, used_colors=used_colors
-            )
-            if found_colors[name]:
-                used_colors.add(found_colors[name])
-
-    # Get reference hue/saturation/lightness from colors that WERE found (not interpolated)
-    found_from_image = [c for c in found_colors.values() if c is not None]
-    if found_from_image:
-        ref_hues = [rgb_to_hsl(*c)[0] for c in found_from_image]
-        ref_saturations = [rgb_to_hsl(*c)[1] for c in found_from_image]
-        ref_lightnesses = [rgb_to_hsl(*c)[2] for c in found_from_image]
-        # Calculate circular mean for hue
-        sin_sum = sum(math.sin(math.radians(h)) for h in ref_hues)
-        cos_sum = sum(math.cos(math.radians(h)) for h in ref_hues)
-        dominant_hue = math.degrees(math.atan2(sin_sum, cos_sum)) % 360
-        ref_s = sum(ref_saturations) / len(ref_saturations)
-        ref_l = sum(ref_lightnesses) / len(ref_lightnesses)
-        # Clamp to usable range
-        ref_s = max(0.5, min(0.8, ref_s))
-        ref_l = max(0.4, min(0.6, ref_l))
-    else:
-        dominant_hue = None
-        ref_s, ref_l = 0.7, 0.5
-
-    # For missing colors, generate synthetic colors that blend target hue with dominant hue
-    # This keeps synthetic colors harmonized with the image's palette
-    color_order = ["red", "yellow", "green", "cyan", "blue", "magenta"]
-    for name in color_order:
-        if found_colors[name] is None:
-            hue_min, hue_max, wrap = hue_ranges[name]
-            if wrap:
-                target_hue = ((hue_min + hue_max + 360) / 2) % 360
-            else:
-                target_hue = (hue_min + hue_max) / 2
-
-            # Blend with dominant hue for visual harmony
-            # Scale blend amount based on hue distance - far colors get less influence
-            if dominant_hue is not None:
-                # Calculate hue distance (0-180)
-                hue_dist = min(abs(target_hue - dominant_hue), 360 - abs(target_hue - dominant_hue))
-                # Close colors: 25% blend, opposite colors: 10% blend
-                blend_amount = 0.25 - (hue_dist / 180) * 0.15
-
-                # Handle hue wraparound for blending
-                diff = target_hue - dominant_hue
-                if diff > 180:
-                    dominant_hue += 360
-                elif diff < -180:
-                    target_hue += 360
-                blended_hue = (target_hue * (1 - blend_amount) + dominant_hue * blend_amount) % 360
-            else:
-                blended_hue = target_hue
-
-            found_colors[name] = hsl_to_rgb(blended_hue, ref_s, ref_l)
-            if verbose:
-                print(f"  Generated synthetic {name}: hue={blended_hue:.0f}° (target={target_hue:.0f}°)")
-
-    # Ensure contrast for all accent colors
-    min_contrast = 3.0
-    for name in found_colors:
-        found_colors[name] = ensure_contrast(found_colors[name], bg_rgb, min_contrast)
-
-    # Generate bright variants (increase lightness by ~20%)
-    bright_colors = {}
-    for name, color in found_colors.items():
-        h, s, l = rgb_to_hsl(*color)
-        if light_mode:
-            new_l = max(0.1, l - 0.15)
-        else:
-            new_l = min(0.9, l + 0.2)
-        bright_colors[name] = hsl_to_rgb(h, s, new_l)
-        bright_colors[name] = ensure_contrast(bright_colors[name], bg_rgb, min_contrast)
+            print(f"  ansi {name:<8} hue={hue:5.1f} C={C:.3f} "
+                  f"-> {rgb_to_hex(*normals[name])} / {rgb_to_hex(*brights[name])}")
 
     return {
-        "color1": found_colors["red"],
-        "color9": bright_colors["red"],
-        "color2": found_colors["green"],
-        "color10": bright_colors["green"],
-        "color3": found_colors["yellow"],
-        "color11": bright_colors["yellow"],
-        "color4": found_colors["blue"],
-        "color12": bright_colors["blue"],
-        "color5": found_colors["magenta"],
-        "color13": bright_colors["magenta"],
-        "color6": found_colors["cyan"],
-        "color14": bright_colors["cyan"],
+        "color1": normals["red"],    "color9": brights["red"],
+        "color2": normals["green"],  "color10": brights["green"],
+        "color3": normals["yellow"], "color11": brights["yellow"],
+        "color4": normals["blue"],   "color12": brights["blue"],
+        "color5": normals["magenta"], "color13": brights["magenta"],
+        "color6": normals["cyan"],   "color14": brights["cyan"],
     }
 
 
-def generate_grayscale(bg_rgb: tuple, fg_rgb: tuple, light_mode: bool = False) -> dict[str, tuple]:
-    """Generate grayscale colors (color0, color7, color8, color15)."""
-    bg_h, bg_s, bg_l = rgb_to_hsl(*bg_rgb)
-    fg_h, fg_s, fg_l = rgb_to_hsl(*fg_rgb)
+def generate_grayscale(bg_rgb: tuple, fg_rgb: tuple, light_mode: bool = False) -> dict:
+    """Neutral ANSI 0/7/8/15 (black, white, bright-black, bright-white), stepped in
+    OKLab L* with a faint bg hue for cohesion."""
+    _, bg_C, bg_h = rgb_to_oklch(bg_rgb)
+    tint = min(bg_C, 0.012)
 
     if light_mode:
-        # color0: Slightly darker than background
-        color0 = hsl_to_rgb(bg_h, bg_s * 0.5, max(0, bg_l - 0.08))
-        # color8: Mid-gray
-        color8 = hsl_to_rgb(bg_h, bg_s * 0.3, (bg_l + fg_l) / 2)
-        # color7: Slightly lighter than foreground
-        color7 = hsl_to_rgb(fg_h, fg_s * 0.3, min(1, fg_l + 0.1))
-        # color15: Same as foreground (darkest text)
-        color15 = fg_rgb
+        levels = {"color0": 0.80, "color8": 0.60, "color7": 0.32, "color15": 0.15}
     else:
-        # color0: Slightly lighter than background
-        color0 = hsl_to_rgb(bg_h, bg_s * 0.5, min(1, bg_l + 0.05))
-        # color8: Mid-gray
-        color8 = hsl_to_rgb(bg_h, bg_s * 0.3, (bg_l + fg_l) / 2)
-        # color7: Slightly darker than foreground
-        color7 = hsl_to_rgb(fg_h, fg_s * 0.3, max(0, fg_l - 0.1))
-        # color15: Same as foreground (brightest text)
-        color15 = fg_rgb
+        levels = {"color0": 0.28, "color8": 0.48, "color7": 0.80, "color15": 0.93}
 
-    return {
-        "color0": color0,
-        "color7": color7,
-        "color8": color8,
-        "color15": color15,
-    }
+    return {name: oklch_to_rgb(L, tint, bg_h) for name, L in levels.items()}
 
 
-def print_color_preview(palette: dict) -> None:
-    """Print color swatches to terminal using 24-bit color."""
-    def color_block(hex_color: str, width: int = 2) -> str:
-        r, g, b = hex_to_rgb(hex_color)
-        return f"\033[48;2;{r};{g};{b}m{' ' * width}\033[0m"
+# ---------------------------------------------------------------------------
+# Gradient (rainbow strip) - always returns exactly `count` colors
+# ---------------------------------------------------------------------------
 
-    def color_text(hex_color: str, text: str) -> str:
-        r, g, b = hex_to_rgb(hex_color)
-        return f"\033[38;2;{r};{g};{b}m{text}\033[0m"
+def select_gradient_colors(colors_weighted: list, count: int = 10,
+                           verbose: bool = False) -> list:
+    """Pick `count` vibrant colors for the gradient, sorted by hue. Guaranteed to
+    return exactly `count`: if the wallpaper is too low-variety to supply enough
+    distinct colors, we synthesize perceptual variations (stepping L* along the hues
+    we have) so the pipeline can never underfill and crash."""
+    data = [(c, rgb_to_oklch(c), d) for c, d in colors_weighted]
 
-    print("\nBackground/Foreground:")
-    bg = palette['special']['background']
-    fg = palette['special']['foreground']
-    cursor = palette['special']['cursor']
-    print(f"  {color_block(bg)} bg {bg}  {color_block(fg)} fg {fg}  {color_block(cursor)} cursor {cursor}")
+    # Candidates: real chroma, not near-black/white.
+    cand = [(c, lch, d) for c, lch, d in data
+            if lch[1] > 0.03 and 0.12 < lch[0] < 0.92]
+    if len(cand) < 2:
+        cand = [(c, lch, d) for c, lch, d in data if lch[1] > 0.015] or data
 
-    print("\nANSI Colors (0-7):")
-    line = "  "
-    for i in range(8):
-        c = palette['colors'][f'color{i}']
-        line += f"{color_block(c)} {i:<2} "
-    print(line)
+    # Rank by vividness with dominance as a gentle noise filter.
+    cand.sort(key=lambda x: -(x[1][1] * (0.4 + 0.6 * x[2])))
 
-    print("ANSI Colors (8-15):")
-    line = "  "
-    for i in range(8, 16):
-        c = palette['colors'][f'color{i}']
-        line += f"{color_block(c)} {i:<2} "
-    print(line)
+    picked = []  # list of (rgb, (L,C,h))
+    for c, lch, _ in cand:
+        L, C, h = lch
+        too_close = any(hue_dist(h, ph) < 12 and abs(L - pL) < 0.10
+                        for _, (pL, _, ph) in picked)
+        if not too_close:
+            picked.append((c, lch))
+        if len(picked) >= count:
+            break
 
-    print("\nColor names:")
-    names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
-    for i, name in enumerate(names):
-        c = palette['colors'][f'color{i}']
-        bright_c = palette['colors'][f'color{i+8}']
-        print(f"  {color_block(c)} {name:<8} {c}  {color_block(bright_c)} bright {bright_c}")
+    # Fill any shortfall with L* variations of what we have (never duplicates).
+    if picked:
+        i = 0
+        step = 1
+        while len(picked) < count:
+            base_c, (L, C, h) = picked[i % len(picked)]
+            shift = 0.09 * step * (1 if (i % 2 == 0) else -1)
+            newL = clamp(L + shift, 0.22, 0.85)
+            picked.append((oklch_to_rgb(newL, C, h), (newL, C, h)))
+            i += 1
+            if i % max(1, len(picked)) == 0:
+                step += 1
+    else:
+        # Total fallback: neutral ramp (monochrome/grayscale image).
+        for k in range(count):
+            L = 0.25 + 0.6 * (k / max(1, count - 1))
+            picked.append((oklch_to_rgb(L, 0.0, 0.0), (L, 0.0, 0.0)))
 
-    print("\nGradient:")
-    line = "  "
-    for i in range(10):
-        c = palette['gradient'][f'g{i}']
-        line += color_block(c, 3)
-    print(line)
-    line = "  "
-    for i in range(10):
-        c = palette['gradient'][f'g{i}']
-        line += f"{c} "
-    print(line)
-    print()
+    # Normalize lightness a touch for a consistent strip, then sort by hue.
+    result = [c for c, _ in picked[:count]]
+    result.sort(key=lambda c: rgb_to_oklch(c)[2])
+    if verbose:
+        print(f"  gradient: {len(result)} colors "
+              f"(hue spread {_hue_spread(result):.0f})")
+    return result
 
 
-def generate_palette(image_path: str, light_mode: bool = False, verbose: bool = False) -> dict:
-    """Generate complete color palette from image."""
+def _hue_spread(colors: list) -> float:
+    hues = sorted(rgb_to_oklch(c)[2] for c in colors)
+    if len(hues) < 2:
+        return 0.0
+    max_gap = 0.0
+    for i in range(len(hues)):
+        nxt = hues[(i + 1) % len(hues)]
+        gap = (nxt - hues[i]) % 360 if i < len(hues) - 1 else (360 - hues[i]) + hues[0]
+        max_gap = max(max_gap, gap)
+    return 360 - max_gap
+
+
+# ---------------------------------------------------------------------------
+# Assemble the wal-format palette
+# ---------------------------------------------------------------------------
+
+def generate_palette(image_path: str, light_mode: bool = False,
+                     verbose: bool = False) -> dict:
     if verbose:
         print(f"Extracting colors from: {image_path}")
 
-    # Extract colors with dominance weights
     colors_weighted = extract_colors_with_dominance(image_path, color_count=30, verbose=verbose)
-
     if not colors_weighted:
-        print("Error: Could not extract colors from image")
+        print("Error: could not extract colors from image")
         sys.exit(1)
 
     if verbose:
         print(f"  Extracted {len(colors_weighted)} colors")
-        print(f"  Top 5 by dominance: {[rgb_to_hex(*c) for c, _ in colors_weighted[:5]]}")
-        print(f"  All colors by dominance:")
-        for c, d in colors_weighted:
-            h, s, l = rgb_to_hsl(*c)
-            brown = is_brown(c)
-            marker = " [brown]" if brown else ""
-            print(f"    {rgb_to_hex(*c)} h:{h:3.0f}° s:{s:.2f} l:{l:.2f} dom:{d:.2f}{marker}")
+        for c, d in colors_weighted[:12]:
+            L, C, h = rgb_to_oklch(c)
+            print(f"    {rgb_to_hex(*c)}  L:{L:.2f} C:{C:.3f} h:{h:5.1f}  dom:{d:.2f}")
 
-    # Detect image type (monochrome vs normal)
     image_type = detect_image_type(colors_weighted)
     if verbose:
         print(f"  Image type: {image_type}")
-
     if image_type == "monochrome":
-        print("Warning: Image appears to be monochrome/low-saturation")
-        print("         Gradient colors may be synthetic")
+        print("Note: low-chroma image; accent colors will lean on canonical defaults")
 
-    # Plain colors list for functions that don't need weights
-    colors = [c for c, _ in colors_weighted]
-
-    # Select base colors
     bg_rgb = select_background(colors_weighted, light_mode)
-    fg_rgb = select_foreground(colors, bg_rgb, light_mode)
-    cursor_rgb = fg_rgb  # Cursor same as foreground
+    _, _, bg_h = rgb_to_oklch(bg_rgb)
+    fg_rgb = select_foreground(bg_rgb, light_mode, bg_hue=bg_h)
+    cursor_rgb = fg_rgb
 
     if verbose:
-        bg_h, bg_s, bg_l = rgb_to_hsl(*bg_rgb)
-        fg_h, fg_s, fg_l = rgb_to_hsl(*fg_rgb)
-        print(f"  Background: {rgb_to_hex(*bg_rgb)} (h:{bg_h:.0f}° s:{bg_s:.2f} l:{bg_l:.2f})")
-        print(f"  Foreground: {rgb_to_hex(*fg_rgb)} (h:{fg_h:.0f}° s:{fg_s:.2f} l:{fg_l:.2f})")
+        bL, bC, bh = rgb_to_oklch(bg_rgb)
+        fL, fC, fh = rgb_to_oklch(fg_rgb)
+        print(f"  Background: {rgb_to_hex(*bg_rgb)} (L:{bL:.2f} C:{bC:.3f} h:{bh:.0f})")
+        print(f"  Foreground: {rgb_to_hex(*fg_rgb)} (L:{fL:.2f} C:{fC:.3f} h:{fh:.0f})")
 
-    # Generate gradient colors first (use weighted - dominance matters for gradient)
     gradient = select_gradient_colors(colors_weighted, count=10, verbose=verbose)
-
-    if verbose:
-        print("  Gradient selection:")
-        for i, c in enumerate(gradient):
-            h, s, l = rgb_to_hsl(*c)
-            print(f"    g{i}: {rgb_to_hex(*c)} (h:{h:.0f}° s:{s:.2f} l:{l:.2f})")
-
-    # Generate ANSI colors, preferring gradient colors when they match hue ranges
-    ansi_colors = map_ansi_colors(colors_weighted, bg_rgb, light_mode, gradient_colors=gradient, verbose=verbose)
-
-    # Generate grayscale
+    ansi_colors = map_ansi_colors(colors_weighted, bg_rgb, light_mode, verbose=verbose)
     grayscale = generate_grayscale(bg_rgb, fg_rgb, light_mode)
 
-    # Build output structure
     palette = {
         "wallpaper": os.path.abspath(image_path),
         "alpha": "100",
@@ -1012,90 +518,139 @@ def generate_palette(image_path: str, light_mode: bool = False, verbose: bool = 
             "color14": rgb_to_hex(*ansi_colors["color14"]),
             "color15": rgb_to_hex(*grayscale["color15"]),
         },
-        "gradient": {
-            f"g{i}": rgb_to_hex(*gradient[i]) for i in range(10)
-        },
+        "gradient": {f"g{i}": rgb_to_hex(*gradient[i]) for i in range(count_of(gradient, 10))},
     }
-
     return palette
 
 
+def count_of(seq, n) -> int:
+    """Defensive: gradient is guaranteed length n, but never index past it."""
+    return min(len(seq), n)
+
+
+# ---------------------------------------------------------------------------
+# themes-system chameleon.json (OKLCh surface ramp + chroma-ranked accents)
+# ---------------------------------------------------------------------------
+
+def _neutral_hex(L: float, bg_rgb: tuple, chroma: float = 0.01) -> str:
+    _, bg_C, bg_h = rgb_to_oklch(bg_rgb)
+    return rgb_to_hex(*oklch_to_rgb(L, min(bg_C, chroma), bg_h))
+
+
+def _surface_ramp(bg_rgb: tuple, light_mode: bool) -> dict:
+    """Perceptually-even structural shades derived from the background in OKLab L*."""
+    bg_L, bg_C, bg_h = rgb_to_oklch(bg_rgb)
+    surf_C = min(bg_C, 0.03)
+
+    if not light_mode:
+        base_L = clamp(bg_L, 0.10, 0.20)
+        offs = {"crust": -0.03, "mantle": 0.0, "base": 0.0, "surface0": 0.045,
+                "surface1": 0.085, "surface2": 0.125, "overlay0": 0.175,
+                "overlay1": 0.245, "overlay2": 0.34}
+    else:
+        base_L = clamp(bg_L, 0.88, 0.97)
+        offs = {"crust": 0.03, "mantle": 0.0, "base": 0.0, "surface0": -0.04,
+                "surface1": -0.075, "surface2": -0.11, "overlay0": -0.16,
+                "overlay1": -0.22, "overlay2": -0.30}
+
+    return {name: rgb_to_hex(*oklch_to_rgb(clamp(base_L + off, 0.03, 0.72), surf_C, bg_h))
+            for name, off in offs.items()}
+
+
+def _rank_accents(colors: dict) -> list:
+    """Rank ANSI normals 1-6 by chroma (vividness) with hue diversity, so the primary
+    accent reflects the wallpaper's signature color instead of always being blue.
+    Returns a list of ('colorN','colorM') = (normal, bright) keys, most vivid first."""
+    slots = [("color1", "color9"), ("color2", "color10"), ("color3", "color11"),
+             ("color4", "color12"), ("color5", "color13"), ("color6", "color14")]
+    scored = []
+    for norm, bright in slots:
+        L, C, h = rgb_to_oklch(hex_to_rgb(colors[norm]))
+        scored.append((C, h, norm, bright))
+    scored.sort(key=lambda x: -x[0])
+
+    picked = []
+    for C, h, norm, bright in scored:
+        if any(hue_dist(h, ph) < 30 for _, ph, _, _ in picked):
+            continue
+        picked.append((C, h, norm, bright))
+    for item in scored:  # top up if diversity filter left <3
+        if item not in picked:
+            picked.append(item)
+        if len(picked) >= 3:
+            break
+    return [(norm, bright) for _, _, norm, bright in picked[:3]]
+
+
 def generate_theme_palette(palette: dict, output_path: str) -> None:
-    """Generate theme palette JSON (chameleon.json format) from extracted colors."""
+    """Map the wal-format palette into the themes-system chameleon.json schema.
+
+    Works purely from the wal palette (special + color0-15 + gradient), so the
+    --from-cache / undo path keeps working. Surfaces are an OKLab ramp from bg;
+    semantics come straight from the (already anchored) ANSI colors; accents are
+    chroma-ranked so the theme's headline color tracks the wallpaper."""
     colors = palette["colors"]
     gradient = palette["gradient"]
     bg = palette["special"]["background"]
     fg = palette["special"]["foreground"]
+    bg_rgb = hex_to_rgb(bg)
+    light_mode = get_luminance(*bg_rgb) > 0.5
 
-    def lighten(hex_color: str, amount: int = 20) -> str:
-        r, g, b = hex_to_rgb(hex_color)
-        r = min(255, r + amount)
-        g = min(255, g + amount)
-        b = min(255, b + amount)
-        return rgb_to_hex(r, g, b)
+    ramp = _surface_ramp(bg_rgb, light_mode)
+    (a0n, a0b), (a1n, a1b), (a2n, a2b) = _rank_accents(colors)
 
-    def darken(hex_color: str, amount: int = 20) -> str:
-        r, g, b = hex_to_rgb(hex_color)
-        r = max(0, r - amount)
-        g = max(0, g - amount)
-        b = max(0, b - amount)
-        return rgb_to_hex(r, g, b)
+    # subtext levels between text and surfaces (neutral).
+    if not light_mode:
+        subtext1 = _neutral_hex(0.74, bg_rgb)
+        subtext0 = _neutral_hex(0.62, bg_rgb)
+    else:
+        subtext1 = _neutral_hex(0.38, bg_rgb)
+        subtext0 = _neutral_hex(0.48, bg_rgb)
 
-    # Background shades
-    bg_dark = darken(bg, 5)
-    bg_light1 = lighten(bg, 10)
-    bg_light2 = lighten(bg, 20)
-    bg_light3 = lighten(bg, 30)
-    bg_light4 = lighten(bg, 40)
-    bg_light5 = lighten(bg, 60)
-
-    # ANSI colors are already hue-mapped by palette-extract:
-    # C1/C9 = red (sem_err), C2/C10 = green (sem_ok),
-    # C3/C11 = yellow (sem_warn), C4/C12 = blue (sem_info)
     theme_palette = {
         "description": "Dynamic theme from wallpaper",
         "colors": {
-            # Structural colors
-            "crust": bg_dark,
-            "mantle": bg,
-            "base": bg,
-            "surface0": bg_light1,
-            "surface1": bg_light2,
-            "surface2": bg_light3,
-            "overlay0": bg_light4,
-            "overlay1": bg_light5,
-            "overlay2": colors["color8"],
+            # Structural (OKLab-even ramp)
+            "crust": ramp["crust"],
+            "mantle": ramp["mantle"],
+            "base": ramp["base"],
+            "surface0": ramp["surface0"],
+            "surface1": ramp["surface1"],
+            "surface2": ramp["surface2"],
+            "overlay0": ramp["overlay0"],
+            "overlay1": ramp["overlay1"],
+            "overlay2": ramp["overlay2"],
             "text": fg,
-            "subtext1": colors["color7"],
-            "subtext0": colors["color15"],
+            "subtext1": subtext1,
+            "subtext0": subtext0,
             "module_fg": bg,
             "module_fg_light": fg,
-            # Accents
-            "accent": colors["color4"],
-            "accent_secondary": colors["color5"],
-            "accent_tertiary": colors["color6"],
-            "accent_bright": colors["color12"],
-            "accent_secondary_bright": colors["color13"],
-            "accent_tertiary_bright": colors["color14"],
-            # Semantic colors (hue-based mapping)
-            "sem_ok": colors["color2"],      # green hue
-            "sem_warn": colors["color3"],    # yellow hue
-            "sem_err": colors["color1"],     # red hue
-            "sem_info": colors["color6"],    # cyan hue
-            "sem_link": colors["color4"],    # blue hue
-            "sem_match": colors["color3"],   # yellow hue
+            # Accents (chroma-ranked from the wallpaper)
+            "accent": colors[a0n],
+            "accent_secondary": colors[a1n],
+            "accent_tertiary": colors[a2n],
+            "accent_bright": colors[a0b],
+            "accent_secondary_bright": colors[a1b],
+            "accent_tertiary_bright": colors[a2b],
+            # Semantics (anchored hues via ANSI slots)
+            "sem_ok": colors["color2"],      # green
+            "sem_warn": colors["color3"],    # yellow
+            "sem_err": colors["color1"],     # red
+            "sem_info": colors["color6"],    # cyan
+            "sem_link": colors["color4"],    # blue
+            "sem_match": colors["color3"],   # yellow
             "sem_cursor": fg,
-            "sem_border": colors["color5"],  # magenta hue
-            "sem_selection": bg_light3,
-            # File type colors
-            "ft_code": colors["color2"],     # green hue
-            "ft_data": colors["color3"],     # yellow hue
-            "ft_media": colors["color5"],    # magenta hue
-            "ft_archive": colors["color6"],  # cyan hue
-            "ft_executable": colors["color1"],  # red hue
-            "ft_build": colors["color4"],    # blue hue
+            "sem_border": colors[a0n],       # headline accent
+            "sem_selection": ramp["surface2"],
+            # File-type colors
+            "ft_code": colors["color2"],
+            "ft_data": colors["color3"],
+            "ft_media": colors["color5"],
+            "ft_archive": colors["color6"],
+            "ft_executable": colors["color1"],
+            "ft_build": colors["color4"],
             "ft_ignore": colors["color8"],
-            # ANSI colors (normal + bright)
+            # ANSI (normal + bright)
             "ansi_red": colors["color1"],
             "ansi_green": colors["color2"],
             "ansi_yellow": colors["color3"],
@@ -1109,89 +664,96 @@ def generate_theme_palette(palette: dict, output_path: str) -> None:
             "ansi_magenta_bright": colors["color13"],
             "ansi_cyan_bright": colors["color14"],
         },
-        "gradient": [gradient[f"g{i}"] for i in range(10)],
+        "gradient": [gradient[f"g{i}"] for i in range(count_of(gradient, 10))],
     }
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(theme_palette, f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Preview
+# ---------------------------------------------------------------------------
+
+def print_color_preview(palette: dict) -> None:
+    def block(hexc, width=2):
+        r, g, b = hex_to_rgb(hexc)
+        return f"\033[48;2;{r};{g};{b}m{' ' * width}\033[0m"
+
+    print("\nBackground/Foreground:")
+    sp = palette["special"]
+    print(f"  {block(sp['background'])} bg {sp['background']}  "
+          f"{block(sp['foreground'])} fg {sp['foreground']}  "
+          f"{block(sp['cursor'])} cursor {sp['cursor']}")
+
+    print("\nANSI Colors (0-7):")
+    print("  " + "".join(f"{block(palette['colors'][f'color{i}'])} {i:<2} " for i in range(8)))
+    print("ANSI Colors (8-15):")
+    print("  " + "".join(f"{block(palette['colors'][f'color{i}'])} {i:<2} " for i in range(8, 16)))
+
+    print("\nColor names:")
+    names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+    for i, name in enumerate(names):
+        c = palette["colors"][f"color{i}"]
+        cb = palette["colors"][f"color{i + 8}"]
+        print(f"  {block(c)} {name:<8} {c}  {block(cb)} bright {cb}")
+
+    print("\nGradient:")
+    n = count_of(palette["gradient"], 10)
+    print("  " + "".join(block(palette["gradient"][f"g{i}"], 3) for i in range(n)))
+    print("  " + " ".join(palette["gradient"][f"g{i}"] for i in range(n)))
+    print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract color palette from image for terminal theming"
+        description="Extract a perceptual color palette from an image for theming"
     )
     parser.add_argument("image", nargs="?", help="Path to image file (optional with --from-cache)")
-    parser.add_argument(
-        "-l", "--light",
-        action="store_true",
-        help="Generate light color scheme"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        help="Output file (default: ~/.cache/wal/colors.json)"
-    )
-    parser.add_argument(
-        "-p", "--print",
-        action="store_true",
-        help="Print palette to stdout instead of writing file"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Show color selection details"
-    )
-    parser.add_argument(
-        "--preview",
-        action="store_true",
-        help="Print color swatches to terminal"
-    )
-    parser.add_argument(
-        "-t", "--generate-theme",
-        action="store_true",
-        help="Generate chameleon.json theme palette and run generate-theme.sh"
-    )
-    parser.add_argument(
-        "--from-cache",
-        action="store_true",
-        help="Skip extraction, use existing ~/.cache/wal/colors.json (for --generate-theme)"
-    )
+    parser.add_argument("-l", "--light", action="store_true", help="Generate light color scheme")
+    parser.add_argument("-o", "--output", help="Output file (default: ~/.cache/wal/colors.json)")
+    parser.add_argument("-p", "--print", action="store_true", help="Print palette JSON to stdout")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show color selection details")
+    parser.add_argument("--preview", action="store_true", help="Print color swatches to terminal")
+    parser.add_argument("-t", "--generate-theme", action="store_true",
+                        help="Generate chameleon.json and run generate-theme.sh")
+    parser.add_argument("--from-cache", action="store_true",
+                        help="Skip extraction, use existing ~/.cache/wal/colors.json")
 
     args = parser.parse_args()
 
-    # Handle --from-cache: skip extraction, load existing colors.json
     if args.from_cache:
         cache_path = os.path.expanduser("~/.cache/wal/colors.json")
         if not os.path.isfile(cache_path):
-            print(f"Error: No cached colors found at {cache_path}")
+            print(f"Error: no cached colors found at {cache_path}")
             sys.exit(1)
         with open(cache_path) as f:
             palette = json.load(f)
         if args.verbose:
             print(f"Loaded cached palette from {cache_path}")
     else:
-        # Require image argument
         if not args.image:
-            print("Error: Image path required (or use --from-cache)")
+            print("Error: image path required (or use --from-cache)")
             sys.exit(1)
-
-        # Validate image exists
         if not os.path.isfile(args.image):
-            print(f"Error: Image not found: {args.image}")
+            print(f"Error: image not found: {args.image}")
             sys.exit(1)
-
-        # Generate palette
         try:
             palette = generate_palette(args.image, light_mode=args.light, verbose=args.verbose)
         except Exception as e:
             print(f"Error extracting colors: {e}")
             sys.exit(1)
 
-    # Print color preview if requested
     if args.preview:
         print_color_preview(palette)
 
-    # Output
     output_json = json.dumps(palette, indent=4)
 
     if args.print:
@@ -1199,31 +761,20 @@ def main():
     else:
         output_path = args.output or os.path.expanduser("~/.cache/wal/colors.json")
         output_dir = os.path.dirname(output_path)
-
-        # Create directory if needed
         os.makedirs(output_dir, exist_ok=True)
-
-        # Also write the wallpaper path to ~/.cache/wal/wal for compatibility
-        # (only when extracting from an image, not when using cached palette)
         if args.image:
-            wal_file = os.path.join(output_dir, "wal")
-            with open(wal_file, "w") as f:
+            with open(os.path.join(output_dir, "wal"), "w") as f:
                 f.write(os.path.abspath(args.image))
-
         with open(output_path, "w") as f:
             f.write(output_json)
-
         print(f"Palette written to {output_path}")
 
-    # Generate theme palette if requested
     if args.generate_theme:
         themes_dir = os.path.expanduser("~/.config/themes")
         chameleon_json = os.path.join(themes_dir, "palettes", "chameleon.json")
-
         print(f"Generating theme palette: {chameleon_json}")
         generate_theme_palette(palette, chameleon_json)
 
-        # Run generate-theme.sh
         scripts_dir = os.path.join(themes_dir, "scripts")
         generate_script = os.path.join(scripts_dir, "generate-theme.sh")
         if os.path.isfile(generate_script):
@@ -1233,13 +784,10 @@ def main():
             if result.returncode != 0:
                 print("Error: generate-theme.sh failed")
                 sys.exit(1)
+            # starship.toml is assembled by generate-theme.sh (build-starship.sh);
+            # the old update-starship-palettes.sh was removed in the 2026-06-17 refactor.
         else:
             print(f"Warning: {generate_script} not found, skipping theme generation")
-
-        # Update starship palettes
-        starship_script = os.path.join(scripts_dir, "update-starship-palettes.sh")
-        if os.path.isfile(starship_script):
-            subprocess.run([starship_script], cwd=scripts_dir, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
