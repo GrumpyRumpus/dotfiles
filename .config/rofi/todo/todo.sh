@@ -1,96 +1,63 @@
 #!/usr/bin/env bash
 # vim:ft=bash
+# ══════════════════════════════════════════════════════════════════════════════
+# Rofi Todo Manager  —  front-end for ~/TODO.md (single source of truth)
+#
+# Lists every open item from ~/TODO.md as its own entry. Actions run through
+# todo.py, which edits ~/TODO.md / ~/DONE.md and commits to ~/.todo.git.
+#   Done   → moves the item's whole block to ~/DONE.md (mirrored section)
+#   Delete → removes the block
+#   Open   → opens ~/TODO.md at the item's line for full context
+#   Add    → appends a new item under ## Inbox
+# ══════════════════════════════════════════════════════════════════════════════
 
-DIR="$(dirname "$0")"
+DIR="$(dirname "$(readlink -f "$0")")"
+PY="python3 $DIR/todo.py"
 ROFI="rofi -dmenu -i -p Todo -theme ${DIR}/style.rasi"
-# ══════════════════════════════════════════════════════════════════════════════
-# Rofi Todo Manager
-# ══════════════════════════════════════════════════════════════════════════════
-todo_file="${XDG_DATA_HOME:-$HOME/.local/share}/todo.txt"
+EDITOR_CMD="${EDITOR:-nvim}"
+TERMINAL="${TERMINAL:-kitty}"
+TODO_MD="$HOME/TODO.md"
 
-touch "$todo_file"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Functions
-# ══════════════════════════════════════════════════════════════════════════════
-
-get_todos() {
-    local line_num=1
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" == "x "* ]]; then
-            echo "  $line_num: ${line#x }"
-        elif [[ -n "$line" ]]; then
-            echo "  $line_num: $line"
-        fi
-        ((line_num++))
-    done < "$todo_file"
+open_at() {                          # open TODO.md at a given line, detached
+    local line="$1"
+    setsid "$TERMINAL" --class todo-edit -e "$EDITOR_CMD" "+${line}" "$TODO_MD" \
+        >/dev/null 2>&1 &
 }
 
-add_todo() {
-    local task
-    task=$(zenity --entry --title="New Task" --text="Enter task:" 2>/dev/null)
-    [[ -n "$task" ]] && echo "$task" >> "$todo_file"
-}
-
-toggle_todo() {
-    local line_num="$1"
-    local line
-    line=$(sed -n "${line_num}p" "$todo_file")
-
-    if [[ "$line" == "x "* ]]; then
-        # Uncomplete
-        sed -i "${line_num}s/^x //" "$todo_file"
-    else
-        # Complete
-        sed -i "${line_num}s/^/x /" "$todo_file"
-    fi
-}
-
-delete_todo() {
-    local line_num="$1"
-    sed -i "${line_num}d" "$todo_file"
-}
-
-todo_actions() {
-    local item="$1"
-    local line_num="${item%%:*}"
-    line_num="${line_num##* }"
-
-    local action
-    action=$(echo -e "󰄬  Toggle Complete\n  Delete\n  Back" | $ROFI)
-
+item_actions() {
+    local item="$1" action line
+    action=$(printf '%s\n' "󰄬  Done" "  Open" "  Delete" "  Back" | $ROFI)
     case "$action" in
-        *"Toggle"*) toggle_todo "$line_num" ;;
-        *"Delete")  delete_todo "$line_num" ;;
+        *"Done")   $PY done   "$item" ;;
+        *"Open")   line=$($PY line "$item"); open_at "$line"; exit 0 ;;
+        *"Delete") $PY delete "$item" ;;
     esac
 }
 
-clear_completed() {
-    sed -i '/^x /d' "$todo_file"
-    notify-send "Todo" "Cleared completed tasks" 2>/dev/null
+add_task() {
+    local task
+    if command -v zenity >/dev/null 2>&1; then
+        task=$(zenity --entry --title="New Task" --text="Enter task:" 2>/dev/null)
+    else
+        task=$(printf '' | rofi -dmenu -p "New task" -theme "${DIR}/style.rasi")
+    fi
+    [[ -n "$task" ]] && $PY add "$task"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main Menu
-# ══════════════════════════════════════════════════════════════════════════════
-
 main_menu() {
-    local todos
-    todos=$(get_todos)
-
-    local options="  Add Task\n󰃢  Clear Completed"
-    [[ -n "$todos" ]] && options="$options\n$todos"
-
-    echo -e "$options" | $ROFI
+    local todos options
+    todos=$($PY list)
+    options=$(printf '%s\n' "  Add Task" "󰈔  Open TODO.md")
+    [[ -n "$todos" ]] && options="$options"$'\n'"$todos"
+    printf '%s\n' "$options" | $ROFI
 }
 
 while true; do
     chosen=$(main_menu)
-
     case "$chosen" in
-        *"Add Task")        add_todo ;;
-        *"Clear Completed") clear_completed ;;
-        "")                 exit 0 ;;
-        *)                  todo_actions "$chosen" ;;
+        "")                exit 0 ;;
+        *"Add Task")       add_task ;;
+        *"Open TODO.md")   open_at 1; exit 0 ;;
+        *)                 item_actions "$chosen" ;;
     esac
 done
