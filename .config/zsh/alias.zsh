@@ -88,6 +88,7 @@ alias glog="git log --graph --pretty='%Cred%h%Creset -%C(auto)%d%Creset %s %Cgre
 
 alias dotfiles=dotbare
 alias config=dotfiles
+alias todo-git='git --git-dir="$HOME/.todo.git" --work-tree="$HOME"'  # local-only TODO.md/DONE.md history
 alias ts=theme
 alias theme-switcher=theme  # backwards compatibility
 alias wp=wallpaper
