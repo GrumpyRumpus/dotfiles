@@ -2,7 +2,7 @@
 # Simple control for the crystal-battle PokeAgent ladder (systemd user service).
 # Usage: ladder {start|stop|status|log|tally|trace|nightly|off}
 #
-#   tally [all|teams|since <date>|<log>]  breakdown of session log(s) (see ladder_tally.awk)
+#   tally [all|teams|arch|since <date>|<log>]  breakdown of session log(s) (see ladder_tally.awk)
 #   trace [<log>]             deep loss-trace pass (loss_trace.py)
 SVC=crystal-ladder.service
 TMR=crystal-ladder.timer
@@ -41,11 +41,13 @@ case "$cmd" in
     #   since <date>  keep only sessions on/after YYYYMMDD (e.g. since 20260727
     #                 to drop the tera-OFF era); implies 'all' when no log named.
     TEAMS=0
+    ARCH=0
     LOGS=""
     SINCE=""
     while [ $# -gt 0 ]; do
       case "$1" in
         teams|--teams)     TEAMS=1 ;;
+        arch|--arch)       ARCH=1 ;;
         all|--all)         LOGS="$(all_logs)" ;;
         since|--since)     SINCE="$2"; shift ;;
         since=*|--since=*) SINCE="${1#*=}" ;;
@@ -72,8 +74,18 @@ case "$cmd" in
     [ -z "$LOGS" ] && { echo "no ladder log yet"; exit 0; }
     AWKF="$CB/showdown/ladder_tally.awk"
     [ -f "$AWKF" ] || { echo "ladder tally: missing $AWKF" >&2; exit 1; }
-    # shellcheck disable=SC2086  # LOGS is an intentional word-split file list
-    awk -v me="$(ps_name)" -v show_teams="$TEAMS" -f "$AWKF" $LOGS
+    # `arch` pools per-team results into archetypes; classify_pool.py rebuilds
+    # the team->archetype map from pool_hl each run so it can't go stale.
+    AMAP=""; ARCHARG=""
+    if [ "$ARCH" = 1 ]; then
+      AMAP=$(mktemp)
+      "$CB"/.venv/bin/python "$CB"/showdown/classify_pool.py \
+          "$CB/showdown/teams/pool_hl" > "$AMAP" 2>/dev/null
+      ARCHARG="-v archmap=$AMAP"
+    fi
+    # shellcheck disable=SC2086  # LOGS/ARCHARG are intentional word-split lists
+    awk -v me="$(ps_name)" -v show_teams="$TEAMS" $ARCHARG -f "$AWKF" $LOGS
+    [ -n "$AMAP" ] && rm -f "$AMAP"
     ;;
   trace)
     # the deep read: collapses, first-deaths, killers, tera timing
@@ -93,6 +105,6 @@ case "$cmd" in
     ;;
   *)
     echo "usage: ladder {start|stop|status|log|tally|trace|nightly|off}"
-    echo "       ladder tally [all] [teams] [since <YYYYMMDD>] [<log>]"
+    echo "       ladder tally [all] [teams] [arch] [since <YYYYMMDD>] [<log>]"
     ;;
 esac
