@@ -1,0 +1,1675 @@
+#!/usr/bin/env python3
+# Triage Firefox bookmarks. GitHub repos are enriched via the GitHub API
+# (through the `gh` CLI) for stars/language/last-push/archived; all other links
+# get a concurrent HTTP health check (alive / redirected / dead / blocked).
+# The "Other Bookmarks" (unfiled) subtree is skipped by default.
+# Emits a markdown report flagging prune/update candidates, duplicates, and a
+# per-folder + per-domain breakdown.
+# Usage: bookmark-triage [-o OUTPUT.md] [--profile NAME] [--json FILE]
+#                        [--stale-years N] [--skip-links] [--include-other]
+#                        [--link-workers N] [--link-timeout SECS] [--quiet]
+
+import argparse
+import base64
+import configparser
+import glob
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Firefox's profile root varies: the classic ~/.mozilla/firefox, or under
+# XDG_CONFIG_HOME when the user runs Firefox with that layout. Try each.
+_XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+FIREFOX_DIRS = [
+    os.path.expanduser("~/.mozilla/firefox"),
+    os.path.join(_XDG_CONFIG, "mozilla", "firefox"),
+]
+DEFAULT_OUTPUT = os.path.expanduser("~/bookmark-triage.md")
+BATCH_SIZE = 80                      # repos per GraphQL request
+LINK_WORKERS = 24                    # global concurrent HTTP checks
+PER_DOMAIN = 3                       # max concurrent checks against one host
+LINK_TIMEOUT = 10                    # seconds per request
+UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
+      "Gecko/20100101 Firefox/128.0")
+NONREPO_OWNERS = {                   # github.com/<this>/... is not a repo
+    "orgs", "settings", "sponsors", "marketplace", "topics", "collections",
+    "features", "about", "pricing", "explore", "notifications", "search",
+    "trending", "apps",
+}
+
+GRAPHQL_FIELDS = """
+  nameWithOwner
+  description
+  stargazerCount
+  forkCount
+  isArchived
+  isFork
+  isDisabled
+  pushedAt
+  primaryLanguage { name }
+  licenseInfo { spdxId }
+  repositoryTopics(first: 12) { nodes { topic { name } } }
+"""
+
+
+def log(msg, quiet=False):
+    if not quiet:
+        print(msg, file=sys.stderr)
+
+
+# ============================================================
+# FIREFOX PROFILE
+# ============================================================
+
+def firefox_dir():
+    # The first Firefox profile root that actually exists on this machine.
+    for d in FIREFOX_DIRS:
+        if os.path.isdir(d):
+            return d
+    sys.exit("no Firefox directory found (looked in: "
+             + ", ".join(FIREFOX_DIRS) + ")")
+
+
+def find_profile(name=None):
+    # Locate the places.sqlite for a Firefox profile. With no name, follow the
+    # default install's profile from profiles.ini; fall back to Default=1.
+    base = firefox_dir()
+    if name:
+        path = os.path.join(base, name)
+        if not os.path.isdir(path):
+            sys.exit(f"profile not found: {path}")
+        return os.path.join(path, "places.sqlite")
+
+    ini = os.path.join(base, "profiles.ini")
+    if not os.path.exists(ini):
+        sys.exit(f"no profiles.ini at {ini}")
+    cfg = configparser.ConfigParser()
+    cfg.read(ini)
+
+    rel = None
+    # ---- prefer the [InstallXXXX] default ----
+    for sec in cfg.sections():
+        if sec.startswith("Install") and cfg.has_option(sec, "Default"):
+            rel = cfg.get(sec, "Default")
+            break
+    # ---- else a [ProfileN] flagged Default=1 ----
+    if rel is None:
+        for sec in cfg.sections():
+            if cfg.has_option(sec, "Default") and cfg.get(sec, "Default") == "1":
+                rel = cfg.get(sec, "Path")
+                break
+    if rel is None:
+        sys.exit("could not determine default Firefox profile")
+
+    path = os.path.join(base, rel, "places.sqlite")
+    if not os.path.exists(path):
+        sys.exit(f"places.sqlite not found at {path}")
+    return path
+
+
+# ============================================================
+# EXTRACT
+# ============================================================
+
+def gh_repo(url):
+    # github.com/<owner>/<repo>... -> "owner/repo", or None if not a repo URL.
+    m = re.match(r"https?://github\.com/([^/]+)/([^/#?]+)", url)
+    if not m:
+        return None
+    owner, name = m.group(1), re.sub(r"\.git$", "", m.group(2))
+    if owner.lower() in NONREPO_OWNERS:
+        return None
+    return f"{owner}/{name}"
+
+
+def domain_of(url):
+    m = re.match(r"https?://([^/]+)", url)
+    if not m:
+        return "?"
+    host = m.group(1).lower().split("@")[-1].split(":")[0]
+    return re.sub(r"^(www\.|m\.)", "", host)
+
+
+# A bookmark's parent is inside the "Other Bookmarks" (unfiled) subtree.
+UNFILED_EXCL = """
+  AND b.parent NOT IN (
+    WITH RECURSIVE unfiled(id) AS (
+      SELECT id FROM moz_bookmarks WHERE guid='unfiled_____'
+      UNION ALL
+      SELECT c.id FROM moz_bookmarks c JOIN unfiled u ON c.parent=u.id
+    ) SELECT id FROM unfiled)
+"""
+
+# A bookmark's parent is inside the tags subtree — these rows are tag
+# *associations*, not real bookmarks, and must never be deleted.
+TAGS_EXCL = """
+  AND b.parent NOT IN (
+    WITH RECURSIVE tags(id) AS (
+      SELECT id FROM moz_bookmarks WHERE guid='tags________'
+      UNION ALL
+      SELECT c.id FROM moz_bookmarks c JOIN tags t ON c.parent=t.id
+    ) SELECT id FROM tags)
+"""
+
+
+def extract(places_path, include_other=False, quiet=False):
+    # Copy the (possibly locked) db, then pull every http(s) bookmark with its
+    # folder, skipping the "Other Bookmarks" (unfiled) subtree unless asked.
+    # Returns rows [(url, title, folder, added)].
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+    shutil.copy(places_path, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        where_excl = "" if include_other else UNFILED_EXCL
+        rows = con.execute(f"""
+            SELECT p.url, b.title, par.title, b.dateAdded
+            FROM moz_bookmarks b
+            JOIN moz_places p   ON b.fk = p.id
+            JOIN moz_bookmarks par ON b.parent = par.id
+            WHERE b.type = 1 AND p.url GLOB 'http*://*'{where_excl}
+        """).fetchall()
+        con.close()
+    finally:
+        os.unlink(tmp)
+    log(f"extracted {len(rows)} bookmarks"
+        f"{'' if include_other else ' (Other Bookmarks excluded)'}", quiet)
+    return rows
+
+
+# ============================================================
+# ENRICH: GITHUB
+# ============================================================
+
+def chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def enrich_github(repos, quiet=False):
+    # Batch repos through the GitHub GraphQL API via `gh`. Repos that fail to
+    # resolve (deleted/renamed/private) are marked {"status": "dead"}.
+    meta = {}
+    done = 0
+    for batch in chunks(repos, BATCH_SIZE):
+        aliases, parts = {}, []
+        for i, repo in enumerate(batch):
+            owner, name = repo.split("/", 1)
+            a = f"r{i}"
+            aliases[a] = repo
+            owner_e, name_e = owner.replace('"', '\\"'), name.replace('"', '\\"')
+            parts.append(f'{a}: repository(owner: "{owner_e}", name: "{name_e}") '
+                         f'{{{GRAPHQL_FIELDS}}}')
+        query = "query {\n" + "\n".join(parts) + "\n}"
+        res = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
+                             capture_output=True, text=True)
+        # gh exits non-zero if ANY node 404s, but still returns partial `data`.
+        data = {}
+        if res.stdout.strip():
+            try:
+                data = json.loads(res.stdout).get("data", {}) or {}
+            except json.JSONDecodeError:
+                log(f"  unparseable batch: {res.stderr[:160]}", quiet)
+        for a, repo in aliases.items():
+            node = data.get(a)
+            if node is None:
+                meta[repo] = {"status": "dead"}
+            else:
+                meta[repo] = {
+                    "status": "ok",
+                    "stars": node["stargazerCount"],
+                    "forks": node["forkCount"],
+                    "archived": node["isArchived"],
+                    "disabled": node["isDisabled"],
+                    "isFork": node["isFork"],
+                    "pushedAt": node.get("pushedAt"),
+                    "lang": (node.get("primaryLanguage") or {}).get("name"),
+                    "license": (node.get("licenseInfo") or {}).get("spdxId"),
+                    "description": node.get("description"),
+                    "topics": [n["topic"]["name"] for n in
+                               ((node.get("repositoryTopics") or {}).get("nodes") or [])],
+                }
+        done += len(batch)
+        log(f"  github {done}/{len(repos)}", quiet)
+    return meta
+
+
+# ============================================================
+# ENRICH: HTTP LINK HEALTH
+# ============================================================
+
+def classify_http(url, code, final):
+    # Map an HTTP status + final URL to a health bucket.
+    redirected = bool(final) and final.rstrip("/") != url.rstrip("/")
+    if 200 <= code < 300:
+        bucket = "alive"
+    elif code in (404, 410):
+        bucket = "dead"
+    elif code in (401, 403, 429):
+        bucket = "blocked"          # bot-blocked / auth — NOT confidently dead
+    elif 400 <= code < 500:
+        bucket = "client_error"
+    elif 500 <= code < 600:
+        bucket = "server_error"
+    else:
+        bucket = "other"
+    return {"bucket": bucket, "code": code,
+            "final": final if redirected else None}
+
+
+def _transient(code):
+    # Errors that warrant a retry: a reset/timeout usually means we hit the host
+    # too hard, not that the page is gone.
+    s = str(code).lower()
+    return ("timeout" in s or "reset" in s or "network is unreachable" in s
+            or "no-response" in s)
+
+
+def _attempt(url, timeout):
+    # One request cycle: HEAD first (cheap), fall back to GET when refused.
+    ctx = ssl.create_default_context()
+    headers = {"User-Agent": UA, "Accept": "*/*"}
+    for method in ("HEAD", "GET"):
+        req = urllib.request.Request(url, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                return classify_http(url, r.getcode(), r.geturl())
+        except urllib.error.HTTPError as e:
+            if method == "HEAD" and e.code in (403, 405, 501):
+                continue                                # method refused: try GET
+            return classify_http(url, e.code, getattr(e, "url", url))
+        except urllib.error.URLError as e:
+            reason = e.reason
+            if isinstance(reason, socket.gaierror):
+                return {"bucket": "dead", "code": "DNS", "final": None}
+            if isinstance(reason, (ssl.SSLCertVerificationError, ssl.SSLError)):
+                return {"bucket": "tls_error", "code": "TLS", "final": None}
+            if isinstance(reason, (socket.timeout, TimeoutError)):
+                return {"bucket": "unreachable", "code": "timeout", "final": None}
+            return {"bucket": "unreachable", "code": str(reason)[:40], "final": None}
+        except (socket.timeout, TimeoutError):
+            return {"bucket": "unreachable", "code": "timeout", "final": None}
+        except Exception as e:                          # noqa: BLE001 — be robust
+            return {"bucket": "unreachable", "code": type(e).__name__, "final": None}
+    return {"bucket": "unreachable", "code": "no-response", "final": None}
+
+
+def check_one(url, timeout, sem):
+    # Throttle per host (sem), and retry transient failures once after a pause —
+    # connection resets are usually self-inflicted from hammering a busy domain.
+    with sem:
+        res = _attempt(url, timeout)
+    if res["bucket"] == "unreachable" and _transient(res["code"]):
+        time.sleep(1.5)
+        with sem:
+            res = _attempt(url, timeout)
+    return res
+
+
+def _pass(urls, workers, timeout, per_domain, label, quiet):
+    health = {}
+    done, total = 0, len(urls)
+    step = max(1, total // 20)
+    sems = defaultdict(lambda: threading.Semaphore(per_domain))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(check_one, u, timeout, sems[domain_of(u)]): u
+                for u in urls}
+        for fut in as_completed(futs):
+            url = futs[fut]
+            try:
+                health[url] = fut.result()
+            except Exception as e:                      # noqa: BLE001
+                health[url] = {"bucket": "unreachable",
+                               "code": type(e).__name__, "final": None}
+            done += 1
+            if done % step == 0 or done == total:
+                log(f"  {label} {done}/{total}", quiet)
+    return health
+
+
+def check_links(urls, workers, timeout, quiet=False):
+    # Main pass at full concurrency, then a gentle low-concurrency recheck of
+    # transient failures (resets/timeouts) — these are usually rate-limiting on
+    # busy hosts (e.g. wiki.archlinux.org), not genuinely dead links.
+    health = _pass(urls, workers, timeout, PER_DOMAIN, "links", quiet)
+    retry = [u for u, v in health.items()
+             if v["bucket"] == "unreachable" and _transient(v["code"])]
+    if retry:
+        log(f"  rechecking {len(retry)} transient failures gently...", quiet)
+        health.update(_pass(retry, max(4, workers // 4), timeout + 4, 1,
+                            "recheck", quiet))
+    return health
+
+
+# ============================================================
+# REPORT
+# ============================================================
+
+def render(rows, gh_meta, health, stale_years):
+    today = datetime.now(timezone.utc)
+    stale_before = (today - timedelta(days=365 * stale_years)).strftime("%Y-%m-%d")
+    today_s = today.strftime("%Y-%m-%d")
+
+    # ---- index the rows ----
+    repo_bm = defaultdict(list)       # owner/repo -> [instance]
+    other_bm = defaultdict(list)      # url -> [instance]
+    url_count = defaultdict(int)
+    repo_urls = defaultdict(set)
+    for url, title, folder, added in rows:
+        inst = {"folder": folder or "(root)", "title": title, "added": added}
+        url_count[url] += 1
+        repo = gh_repo(url)
+        if repo:
+            repo_bm[repo].append(inst)
+            repo_urls[repo].add(url)
+        else:
+            other_bm[url].append(inst)
+
+    o = []
+    w = o.append
+
+    # ======================= header =======================
+    n_repos = len(repo_bm)
+    n_other = len(other_bm)
+    w("# Bookmark Triage")
+    w("")
+    w(f"_{len(rows)} bookmarks · {n_repos} GitHub repos · {n_other} other links "
+      f"· generated {today_s}_")
+    w("")
+
+    # ======================= GITHUB =======================
+    if gh_meta:
+        ok = [r for r in repo_bm if gh_meta.get(r, {}).get("status") == "ok"]
+        dead = [r for r in repo_bm if gh_meta.get(r, {}).get("status") == "dead"]
+        archived = [r for r in ok if gh_meta[r]["archived"]]
+        stale = [r for r in ok if not gh_meta[r]["archived"]
+                 and (gh_meta[r]["pushedAt"] or "")[:10] < stale_before]
+
+        def stars(r):
+            return gh_meta.get(r, {}).get("stars", 0)
+
+        def gline(r, flag=""):
+            m = gh_meta[r]
+            desc = (m.get("description") or "").strip().replace("\n", " ")
+            if len(desc) > 90:
+                desc = desc[:87] + "..."
+            lang = m.get("lang") or "—"
+            tail = f" — {desc}" if desc else ""
+            return (f"- **[{r}](https://github.com/{r})** ★{m['stars']:,} · "
+                    f"{lang} · pushed {(m.get('pushedAt') or '')[:10]}{tail}{flag}")
+
+        w("## GitHub repos")
+        w("")
+        w("| Metric | Count |")
+        w("|---|---|")
+        w(f"| Unique repos | {n_repos} |")
+        w(f"| **Dead / renamed / private** | **{len(dead)}** |")
+        w(f"| Archived upstream | {len(archived)} |")
+        w(f"| Stale (no push since {stale_before}) | {len(stale)} |")
+        w(f"| Combined stars | {sum(stars(r) for r in ok):,} |")
+        w("")
+        w(f"### ⚑ Dead / renamed / deleted repos ({len(dead)})")
+        w("")
+        for r in sorted(dead):
+            folders = ", ".join(sorted({i["folder"] for i in repo_bm[r]}))
+            w(f"- `{r}` — in _{folders}_")
+        w("")
+        w(f"### Archived upstream ({len(archived)})")
+        w("")
+        for r in sorted(archived, key=stars, reverse=True):
+            w(gline(r))
+        w("")
+        w("### ★ Most-starred (top 30)")
+        w("")
+        for r in sorted(ok, key=stars, reverse=True)[:30]:
+            w(gline(r))
+        w("")
+
+    # ======================= NON-GITHUB =======================
+    if health:
+        by_bucket = defaultdict(list)
+        for url in other_bm:
+            by_bucket[health.get(url, {}).get("bucket", "unchecked")].append(url)
+
+        def oline(url, note=""):
+            titles = [i["title"] for i in other_bm[url] if i["title"]]
+            title = (titles[0][:70] + "…") if titles and len(titles[0]) > 70 \
+                else (titles[0] if titles else "")
+            folders = ", ".join(sorted({i["folder"] for i in other_bm[url]}))
+            label = f"{title} — " if title else ""
+            return f"- {label}<{url}> _({folders})_{note}"
+
+        w("## Non-GitHub links")
+        w("")
+        w("| Health | Count |")
+        w("|---|---|")
+        w(f"| Alive | {len(by_bucket['alive'])} |")
+        w(f"| Redirected (new URL) | "
+          f"{sum(1 for u in other_bm if health.get(u, {}).get('final'))} |")
+        w(f"| **Dead (404/410/DNS)** | **{len(by_bucket['dead'])}** |")
+        w(f"| Blocked / unverifiable (403/429) | {len(by_bucket['blocked'])} |")
+        w(f"| Server error (5xx) | {len(by_bucket['server_error'])} |")
+        w(f"| Client error (other 4xx) | {len(by_bucket['client_error'])} |")
+        w(f"| TLS / cert error | {len(by_bucket['tls_error'])} |")
+        w(f"| Unreachable (timeout/conn) | {len(by_bucket['unreachable'])} |")
+        w("")
+
+        dead_links = by_bucket["dead"]
+        w(f"### ⚑ Dead links — prune candidates ({len(dead_links)})")
+        w("404 / 410 / DNS failure. Confidently gone.")
+        w("")
+        for url in sorted(dead_links, key=domain_of):
+            code = health[url]["code"]
+            w(oline(url, f" `{code}`"))
+        w("")
+
+        redirected = [u for u in other_bm if health.get(u, {}).get("final")]
+        w(f"### ⤳ Redirected — update candidates ({len(redirected)})")
+        w("Bookmark resolves but lands elsewhere now. Consider updating the URL.")
+        w("")
+        for url in sorted(redirected, key=domain_of):
+            w(oline(url, f"\n    → now: <{health[url]['final']}>"))
+        w("")
+
+        for label, key in [("Server errors (5xx)", "server_error"),
+                           ("Other client errors (4xx)", "client_error"),
+                           ("TLS / certificate errors", "tls_error"),
+                           ("Unreachable (timeout/connection)", "unreachable")]:
+            urls = by_bucket[key]
+            if not urls:
+                continue
+            w(f"### {label} ({len(urls)})")
+            w("May be temporary — recheck before pruning.")
+            w("")
+            for url in sorted(urls, key=domain_of):
+                w(oline(url, f" `{health[url]['code']}`"))
+            w("")
+
+        if by_bucket["blocked"]:
+            w(f"### Blocked / unverifiable ({len(by_bucket['blocked'])})")
+            w("Returned 403/429 to an automated request — almost certainly fine "
+              "in a browser; not prunable on this signal.")
+            w("")
+            dom_blocked = defaultdict(int)
+            for url in by_bucket["blocked"]:
+                dom_blocked[domain_of(url)] += 1
+            for dom, c in sorted(dom_blocked.items(), key=lambda kv: -kv[1]):
+                w(f"- `{dom}` — {c}")
+            w("")
+
+        # ---- top domains ----
+        dom_count = defaultdict(int)
+        for url in other_bm:
+            dom_count[domain_of(url)] += 1
+        w("### Top domains")
+        w("")
+        for dom, c in sorted(dom_count.items(), key=lambda kv: -kv[1])[:25]:
+            w(f"- `{dom}` — {c}")
+        w("")
+
+    # ======================= SHARED: DUPLICATES =======================
+    true_dupes = {u: c for u, c in url_count.items() if c > 1}
+    multipage = {r: us for r, us in repo_urls.items() if len(us) > 1}
+    w(f"## ⧉ Duplicate URLs ({len(true_dupes)})")
+    w("Identical URL bookmarked more than once.")
+    w("")
+    for u, c in sorted(true_dupes.items(), key=lambda kv: -kv[1]):
+        w(f"- `{u}` ×{c}")
+    w("")
+    if multipage:
+        w(f"## ⌥ GitHub repos saved as many sub-pages ({len(multipage)})")
+        w("")
+        for r in sorted(multipage, key=lambda r: -len(multipage[r]))[:25]:
+            w(f"- `{r}` — {len(multipage[r])} distinct pages")
+        w("")
+
+    # ======================= PER-FOLDER =======================
+    w("## By folder")
+    w("")
+    folder_items = defaultdict(lambda: {"repos": set(), "links": set()})
+    for url, title, folder, added in rows:
+        f = folder or "(root)"
+        if gh_repo(url):
+            folder_items[f]["repos"].add(gh_repo(url))
+        else:
+            folder_items[f]["links"].add(url)
+    for folder in sorted(folder_items,
+                         key=lambda f: -(len(folder_items[f]["repos"])
+                                         + len(folder_items[f]["links"]))):
+        repos = folder_items[folder]["repos"]
+        links = folder_items[folder]["links"]
+        ndead_l = sum(1 for u in links if health.get(u, {}).get("bucket") == "dead")
+        ndead_r = sum(1 for r in repos
+                      if gh_meta.get(r, {}).get("status") == "dead")
+        flags = []
+        if ndead_l or ndead_r:
+            flags.append(f"{ndead_l + ndead_r} dead")
+        flag_s = f" · {', '.join(flags)}" if flags else ""
+        w(f"### {folder} ({len(repos)} repos · {len(links)} links{flag_s})")
+        w("")
+        if gh_meta and repos:
+            for r in sorted(repos,
+                            key=lambda r: gh_meta.get(r, {}).get("stars", 0),
+                            reverse=True)[:5]:
+                if gh_meta.get(r, {}).get("status") == "ok":
+                    m = gh_meta[r]
+                    w(f"- **[{r}](https://github.com/{r})** ★{m['stars']:,}")
+        w("")
+
+    return "\n".join(o)
+
+
+# ============================================================
+# APPLY: PRUNE DEAD + DUPLICATE BOOKMARKS
+# ============================================================
+# Only deletions — the one mutation that's safe to do on places.sqlite from
+# plain sqlite3. There are no triggers on moz_bookmarks/moz_places (Firefox
+# maintains them from C++), so removing a leaf bookmark row is clean. We never
+# touch moz_places, so history/frecency are untouched; Firefox's periodic
+# maintenance reaps any orphaned place rows. URL *rewrites* (redirects) are
+# deliberately out of scope: they'd need a new moz_places row with a correct
+# Firefox url_hash, and getting that wrong silently breaks bookmark lookups.
+
+
+def firefox_running(places_path):
+    # True if Firefox has this profile open — writing places.sqlite then would
+    # corrupt it. Firefox opens places with locking_mode=EXCLUSIVE, so the
+    # authoritative, profile-specific test is whether we can take a write lock.
+    # (Checking the profile `lock` symlink instead gives false positives: an
+    # unclean exit leaves a stale lock pointing at a dead PID.)
+    try:
+        con = sqlite3.connect(places_path, timeout=1)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("ROLLBACK")
+        finally:
+            con.close()
+        return False
+    except sqlite3.OperationalError:
+        return True
+
+
+def load_bookmark_ids(places_path, include_other):
+    # [(id, url)] for deletable leaf bookmarks, mirroring extract()'s scope but
+    # always excluding the tags subtree. Read from a copy so it works while
+    # Firefox is open (for dry-run preview).
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+    shutil.copy(places_path, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        where_excl = "" if include_other else UNFILED_EXCL
+        rows = con.execute(f"""
+            SELECT b.id, p.url
+            FROM moz_bookmarks b
+            JOIN moz_places p ON b.fk = p.id
+            WHERE b.type = 1 AND p.url GLOB 'http*://*'{where_excl}{TAGS_EXCL}
+        """).fetchall()
+        con.close()
+    finally:
+        os.unlink(tmp)
+    return rows
+
+
+def plan_deletions(id_rows, dead_urls, dedupe):
+    # Decide which bookmark ids to delete. Returns (dead_ids, dupe_ids).
+    # dead: every instance of a confirmed-gone URL. dupe (opt-in): collapse a
+    # repeated URL to its earliest (lowest-id) row, but skip URLs already gone.
+    dead_ids, dupe_ids = set(), set()
+    by_url = defaultdict(list)
+    for bid, url in id_rows:
+        by_url[url].append(bid)
+    for url, ids in by_url.items():
+        if url in dead_urls:
+            dead_ids.update(ids)
+        elif dedupe and len(ids) > 1:
+            dupe_ids.update(sorted(ids)[1:])
+    return dead_ids, dupe_ids
+
+
+def backup_db(places_path, quiet):
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dst = f"{places_path}.triage-bak-{ts}"
+    shutil.copy2(places_path, dst)
+    for ext in ("-wal", "-shm"):           # keep the backup internally consistent
+        if os.path.exists(places_path + ext):
+            shutil.copy2(places_path + ext, dst + ext)
+    log(f"  backup -> {dst}", quiet)
+    return dst
+
+
+def apply_deletions(places_path, del_ids, quiet):
+    con = sqlite3.connect(places_path)
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # fold in any pending WAL
+        con.executemany("DELETE FROM moz_bookmarks WHERE id = ?",
+                        [(i,) for i in sorted(del_ids)])
+        con.commit()
+    finally:
+        con.close()
+    log(f"  deleted {len(del_ids)} bookmark rows", quiet)
+
+
+def run_apply(places_path, id_rows, dead_urls, dedupe, do_apply, quiet):
+    # Print the deletion plan; execute it only when do_apply and it's safe.
+    dead_ids, dupe_ids = plan_deletions(id_rows, dead_urls, dedupe)
+    del_ids = dead_ids | dupe_ids
+    url_by_id = dict(id_rows)
+
+    url_counts = defaultdict(int)
+    for _, url in id_rows:
+        url_counts[url] += 1
+    extra_dupes = sum(c - 1 for u, c in url_counts.items()
+                      if c > 1 and u not in dead_urls)
+
+    log("", quiet)
+    log(f"prune plan: {len(dead_ids)} dead"
+        + (f" + {len(dupe_ids)} duplicate" if dedupe else "")
+        + f" = {len(del_ids)} bookmark(s)", quiet)
+    if not quiet:
+        for bid in sorted(dead_ids):
+            log(f"  dead  {url_by_id.get(bid, '?')}", quiet)
+        for bid in sorted(dupe_ids):
+            log(f"  dupe  {url_by_id.get(bid, '?')}", quiet)
+        if not dedupe and extra_dupes:
+            log(f"  ({extra_dupes} duplicate row(s) present — "
+                f"pass --dedupe to collapse them)", quiet)
+
+    if not del_ids:
+        log("nothing to prune.", quiet)
+        return
+    if not do_apply:
+        log("dry run — re-run with --apply to delete these.", quiet)
+        return
+    if firefox_running(places_path):
+        sys.exit("Firefox is running with this profile — close it first, "
+                 "then re-run with --apply (writing places.sqlite live corrupts it).")
+
+    backup_db(places_path, quiet)
+    apply_deletions(places_path, del_ids, quiet)
+    log("done. restart Firefox to see the pruned bookmarks.", quiet)
+
+
+# ============================================================
+# ORGANIZE: REGROUP GITHUB BOOKMARKS BY TOPIC (propose-first)
+# ============================================================
+# Only GitHub repo bookmarks; only MOVES + folder CREATE (never delete/merge).
+# Strategy: the user's existing dev folders ARE the taxonomy. We respect repos
+# already filed in a real topic folder, and only redistribute the ones sitting
+# in vague "catch-all" folders into the best matching topic folder (resolved
+# against the existing folders by name). Low-confidence repos are LEFT in place.
+# Safe vs the url_hash problem: moves/folder-creates touch only moz_bookmarks.
+
+# Vague folders whose GitHub contents are candidates to redistribute.
+CATCHALL_FOLDERS = {
+    "should integrate", "unused", "sample code", "resources", "fun", "misc",
+    "miscellaneous", "to sort", "unsorted", "unfiled", "(root)", "stuff",
+}
+
+# Canonical topic folder -> match terms (name/description/github-topic/language).
+# Targets are only used if a folder of that name already exists in the profile.
+TOPIC_KEYWORDS = {
+    "Dotfiles":     ["dotfiles", "dotfile", "ricing", "rice", "my-config"],
+    "Hyprland":     ["hyprland", "hyprpaper", "hyprlock", "hypridle", "hyprcursor"],
+    "AI":           ["llm", "gpt", "chatbot", "machine-learning", "rag", "agent",
+                     "llama", "stable-diffusion", "diffusion", "transformer",
+                     "openai", "anthropic", "ollama", "ai-"],
+    "TUI":          ["tui", "ncurses", "ratatui", "bubbletea", "textual",
+                     "terminal-ui"],
+    "CLI":          ["cli", "command-line", "commandline"],
+    "Themes":       ["colorscheme", "color-scheme", "gtk-theme", "icon-theme",
+                     "pywal", "base16", "theming", "theme"],
+    "Editors":      ["neovim", "nvim", "vim", "emacs", "vscode", "lsp",
+                     "tree-sitter", "editor"],
+    "Self-Hosted":  ["self-hosted", "selfhosted", "homelab", "self-hosting"],
+    "Awesome Lists": ["awesome"],
+    "Hydrus":       ["hydrus"],
+    "Backgrounds":  ["wallpaper", "wallpapers"],
+    "Games":        ["roguelike", "doom", "pygame", "platformer", "game-engine",
+                     "videogame", "game", "games"],
+    "Fonts":        ["typeface", "monospace-font", "nerd-font", "bitmap-font",
+                     "font", "fonts"],
+}
+# Generic terms -> low confidence (won't move on their own).
+WEAK_TERMS = {"tool", "tools", "utility", "utilities", "script", "scripts"}
+
+# Optional LLM fallback for repos the keyword rules can't place: batch them
+# through a local Ollama model that picks from the user's existing folders.
+GEMMA_MODEL = "gemma4:26b-a4b-it-q4_K_M"
+OLLAMA_CHAT = "http://localhost:11434/api/chat"
+GEMMA_BATCH = 20
+
+
+def gemma_classify(pending, gh_meta, candidate_folders, model, quiet):
+    # pending: [(bid, repo, current_folder, parent_id)]. Returns {repo: folder|None},
+    # where folder is one of candidate_folders (verbatim) or None ("no clear fit").
+    folder_list = ", ".join(candidate_folders)
+    sys_prompt = (
+        "You sort GitHub repositories into a user's existing bookmark folders. "
+        "For each repo pick the single best-fitting folder from the allowed list, "
+        "or \"none\" if nothing clearly fits. Use folder names verbatim; never "
+        "invent a folder. Prefer \"none\" over a weak guess.")
+    out = {}
+    done = 0
+    for batch in chunks(pending, GEMMA_BATCH):
+        lines = []
+        for bid, repo, folder, parent in batch:
+            m = gh_meta.get(repo, {})
+            desc = (m.get("description") or "").replace("\n", " ")[:160]
+            topics = ",".join(m.get("topics", [])[:8])
+            lines.append(f"- {repo} | lang={m.get('lang') or ''} "
+                         f"| topics={topics} | {desc}")
+        user_prompt = (f"Allowed folders: {folder_list}\n\n"
+                       "Classify each repo below. Respond ONLY with JSON of the "
+                       'form {"assignments": {"owner/repo": "Folder or none"}}.\n\n'
+                       + "\n".join(lines))
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": sys_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "format": "json", "stream": False, "think": False,
+            "keep_alive": "5m", "options": {"temperature": 0},
+        }
+        try:
+            req = urllib.request.Request(
+                OLLAMA_CHAT, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=180) as r:
+                content = json.load(r)["message"]["content"]
+            assigns = json.loads(content).get("assignments", {})
+        except Exception as e:                          # noqa: BLE001
+            log(f"  gemma batch failed ({type(e).__name__}: {e}) — "
+                f"leaving this batch unclassified", quiet)
+            assigns = {}
+        for bid, repo, folder, parent in batch:
+            out[repo] = assigns.get(repo)
+        done += len(batch)
+        log(f"  gemma {done}/{len(pending)}", quiet)
+    # keep only assignments that name a real candidate folder (case-insensitive)
+    canon = {c.lower(): c for c in candidate_folders}
+    return {repo: canon.get((val or "").lower()) for repo, val in out.items()}
+
+
+def _new_guid():
+    # Firefox bookmark GUID: 12 chars from the base64url alphabet.
+    return base64.urlsafe_b64encode(os.urandom(9)).decode()
+
+
+def classify_repo(repo, meta):
+    # -> (topic_name, confidence) where confidence in {"high","low",None}.
+    m = meta.get(repo, {})
+    name = repo.lower()
+    desc = (m.get("description") or "").lower()
+    topics = [t.lower() for t in m.get("topics", [])]
+    lang = (m.get("lang") or "").lower()
+    hay = " ".join([name, desc, " ".join(topics)])
+
+    for folder, terms in TOPIC_KEYWORDS.items():
+        for t in terms:
+            if t in topics:                       # explicit GitHub topic = strong
+                return folder, "high"
+            if t == "awesome" and name.split("/")[-1].startswith("awesome"):
+                return folder, "high"
+            if t in hay and t not in WEAK_TERMS:  # name/desc hit = strong-ish
+                return folder, "high"
+    # language-only fallbacks (weak)
+    if lang in ("vim script", "viml"):
+        return "Editors", "low"
+    return None, None
+
+
+def load_github_bookmarks(places_path):
+    # [(bid, url, repo, parent_id, folder_name)] for every GitHub repo bookmark.
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+    shutil.copy(places_path, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        rows = con.execute(f"""
+            SELECT b.id, p.url, b.parent, par.title
+            FROM moz_bookmarks b
+            JOIN moz_places p ON b.fk = p.id
+            JOIN moz_bookmarks par ON b.parent = par.id
+            WHERE b.type = 1 AND p.url GLOB 'http*://github.com/*'{TAGS_EXCL}
+        """).fetchall()
+        con.close()
+    finally:
+        os.unlink(tmp)
+    out = []
+    for bid, url, parent, folder in rows:
+        repo = gh_repo(url)
+        if repo:
+            out.append((bid, url, repo, parent, folder or "(root)"))
+    return out
+
+
+def discover_topic_folders(places_path):
+    # All folders (outside the tags subtree) -> {name_lower: (folder_id, gh_count)}
+    # resolving duplicate names to the instance with the most GitHub children
+    # (then most children). Also returns dev_root: the PARENT of the folder
+    # holding the most repos, so newly-created folders land as siblings of the
+    # existing topic folders rather than nested inside one.
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+    shutil.copy(places_path, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        rows = con.execute("""
+            SELECT f.id, f.title, f.parent,
+              (SELECT count(*) FROM moz_bookmarks b JOIN moz_places p ON b.fk=p.id
+                 WHERE b.parent=f.id AND b.type=1
+                   AND p.url GLOB 'http*://github.com/*') gh,
+              (SELECT count(*) FROM moz_bookmarks c WHERE c.parent=f.id) total
+            FROM moz_bookmarks f
+            WHERE f.type = 2 AND f.parent NOT IN (
+              WITH RECURSIVE tags(id) AS (
+                SELECT id FROM moz_bookmarks WHERE guid='tags________'
+                UNION ALL
+                SELECT c.id FROM moz_bookmarks c JOIN tags t ON c.parent=t.id
+              ) SELECT id FROM tags)
+        """).fetchall()
+        con.close()
+    finally:
+        os.unlink(tmp)
+    best = {}
+    max_gh = (-1, None)            # (gh_count, parent_of_that_folder)
+    for fid, title, parent, gh, total in rows:
+        key = (title or "(root)").lower()
+        if key not in best or (gh, total) > (best[key][1], best[key][2]):
+            best[key] = (fid, gh, total, title or "(root)")
+        if gh > max_gh[0]:
+            max_gh = (gh, parent)
+    folders = {k: (v[0], v[1], v[3]) for k, v in best.items()}  # name->(id,gh,title)
+    return folders, max_gh[1]
+
+
+def plan_organize(places_path, gh_meta, use_gemma=False, gemma_model=None,
+                  quiet=False, extra_folders=()):
+    # Build the move plan. Returns dict with moves / left / kept and folder info.
+    # Rule classifier runs first; an optional Gemma pass classifies its leftovers
+    # against the user's existing (>=2-repo, non-catch-all) topic folders, plus
+    # any extra_folders (created on demand if a repo is assigned to them).
+    gh = load_github_bookmarks(places_path)
+    folders, dev_root = discover_topic_folders(places_path)   # name->(id,gh,title)
+    extra_set = set(extra_folders)   # always offered as targets; created if absent
+    candidate_folders = sorted(
+        {title for (_id, ghc, title) in folders.values()
+         if ghc >= 2 and title.lower() not in CATCHALL_FOLDERS} | extra_set)
+
+    moves, pending, kept = [], [], []
+    for bid, url, repo, parent_id, folder in gh:
+        meta = gh_meta.get(repo, {})
+        in_catchall = folder.lower() in CATCHALL_FOLDERS
+        archived = meta.get("status") == "ok" and meta.get("archived")
+
+        if archived and in_catchall:
+            tinfo = folders.get("archived")
+            moves.append((bid, repo, folder, "Archived",
+                          tinfo[0] if tinfo else None, "rule"))
+            continue
+        if not in_catchall:
+            kept.append((bid, repo, folder))
+            continue
+        topic, conf = classify_repo(repo, meta)
+        tinfo = folders.get(topic.lower()) if topic else None
+        if topic and conf == "high" and tinfo and tinfo[0] != parent_id:
+            moves.append((bid, repo, folder, topic, tinfo[0], "rule"))
+        else:
+            pending.append((bid, repo, folder, parent_id))
+
+    left = []
+    if use_gemma and pending and candidate_folders:
+        log(f"  classifying {len(pending)} leftover repos with "
+            f"{gemma_model}...", quiet)
+        assigned = gemma_classify(pending, gh_meta, candidate_folders,
+                                  gemma_model, quiet)
+        for bid, repo, folder, parent_id in pending:
+            tgt = assigned.get(repo)
+            tinfo = folders.get(tgt.lower()) if tgt else None
+            if tgt and tinfo and tinfo[0] != parent_id:
+                moves.append((bid, repo, folder, tgt, tinfo[0], "gemma"))
+            elif tgt and tinfo is None and tgt in extra_set:    # new seeded folder
+                moves.append((bid, repo, folder, tgt, None, "gemma"))
+            else:
+                left.append((bid, repo, folder, "—"))
+    else:
+        left = [(bid, repo, folder, "—") for bid, repo, folder, _ in pending]
+
+    return {"moves": moves, "left": left, "kept": kept,
+            "folders": folders, "dev_root": dev_root}
+
+
+def render_organize_section(plan):
+    out = []
+    w = out.append
+    moves, left = plan["moves"], plan["left"]
+    by_target = defaultdict(list)
+    for bid, repo, folder, target, tid, src in moves:
+        by_target[target].append((repo, folder, tid, src))
+    n_gemma = sum(1 for *_, src in moves if src == "gemma")
+
+    w("\n## ↪ Proposed GitHub reorg")
+    w(f"_{len(moves)} repo(s) to move ({n_gemma} via Gemma) · "
+      f"{len(left)} left in place · {len(plan['kept'])} already well-filed_")
+    w("")
+    w("Only repos in catch-all folders are moved, into your existing topic "
+      "folders. ✦ = picked by Gemma. Review and run `--organize-apply` to "
+      "perform these moves.")
+    w("")
+    for target in sorted(by_target):
+        items = by_target[target]
+        new = " _(new folder)_" if items[0][2] is None else ""
+        w(f"### → {target} ({len(items)}){new}")
+        for repo, folder, _tid, src in sorted(items):
+            tag = " ✦" if src == "gemma" else ""
+            w(f"- `{repo}`  _(from {folder})_{tag}")
+        w("")
+    if left:
+        w(f"### Left in place — unclassified ({len(left)})")
+        w("In a catch-all folder but no confident topic match; untouched.")
+        w("")
+        for bid, repo, folder, topic in sorted(left, key=lambda x: x[1]):
+            w(f"- `{repo}`  _(in {folder})_")
+        w("")
+    return "\n".join(out)
+
+
+def apply_organize(places_path, plan, quiet):
+    if firefox_running(places_path):
+        sys.exit("Firefox is running with this profile — close it first, "
+                 "then re-run with --organize-apply.")
+    if not plan["moves"]:
+        log("nothing to reorganize.", quiet)
+        return
+    backup_db(places_path, quiet)
+    now_us = int(time.time() * 1_000_000)
+    undo = {}
+    con = sqlite3.connect(places_path)
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # resolve/create each target folder once
+        target_id = {}
+        for bid, repo, folder, target, tid, conf in plan["moves"]:
+            if target in target_id:
+                continue
+            if tid is not None:
+                target_id[target] = tid
+            else:                                  # create under the dev root
+                parent = plan["dev_root"] or 2     # fall back to Bookmarks Menu
+                pos = con.execute("SELECT COALESCE(MAX(position)+1,0) "
+                                  "FROM moz_bookmarks WHERE parent=?",
+                                  (parent,)).fetchone()[0]
+                cur = con.execute(
+                    "INSERT INTO moz_bookmarks(type,fk,parent,position,title,"
+                    "dateAdded,lastModified,guid,syncStatus,syncChangeCounter) "
+                    "VALUES(2,NULL,?,?,?,?,?,?,1,1)",
+                    (parent, pos, target, now_us, now_us, _new_guid()))
+                target_id[target] = cur.lastrowid
+        # move bookmarks
+        touched_parents = set()
+        for bid, repo, folder, target, tid, conf in plan["moves"]:
+            dest = target_id[target]
+            old_parent = con.execute("SELECT parent FROM moz_bookmarks WHERE id=?",
+                                     (bid,)).fetchone()[0]
+            undo[str(bid)] = old_parent
+            pos = con.execute("SELECT COALESCE(MAX(position)+1,0) "
+                              "FROM moz_bookmarks WHERE parent=?",
+                              (dest,)).fetchone()[0]
+            con.execute("UPDATE moz_bookmarks SET parent=?, position=?, "
+                        "lastModified=?, syncChangeCounter=syncChangeCounter+1 "
+                        "WHERE id=?", (dest, pos, now_us, bid))
+            touched_parents.update((old_parent, dest))
+        for pid in touched_parents:
+            con.execute("UPDATE moz_bookmarks SET lastModified=? WHERE id=?",
+                        (now_us, pid))
+        con.commit()
+    finally:
+        con.close()
+    undo_path = os.path.expanduser("~/bookmark-triage-organize-undo.json")
+    with open(undo_path, "w") as f:
+        json.dump(undo, f)
+    log(f"  moved {len(plan['moves'])} bookmark(s); undo map -> {undo_path}", quiet)
+    log("done. restart Firefox to see the reorganized folders.", quiet)
+
+
+def run_organize(places_path, gh_meta, do_apply, quiet, report_path,
+                 use_gemma=False, gemma_model=GEMMA_MODEL, extra_folders=()):
+    plan = plan_organize(places_path, gh_meta, use_gemma, gemma_model, quiet,
+                         extra_folders)
+    section = render_organize_section(plan)
+    with open(report_path, "a") as f:
+        f.write("\n" + section + "\n")
+    log("", quiet)
+    log(f"organize plan: {len(plan['moves'])} move(s), "
+        f"{len(plan['left'])} left unclassified, "
+        f"{len(plan['kept'])} already well-filed "
+        f"(details appended to {report_path})", quiet)
+    if not do_apply:
+        if plan["moves"]:
+            log("propose only — re-run with --organize-apply to perform the moves.",
+                quiet)
+        return
+    apply_organize(places_path, plan, quiet)
+
+
+# ============================================================
+# FIX REDIRECTS: repoint bookmarks at their new URL (propose-first)
+# ============================================================
+# The riskiest op: it writes moz_places. To stay safe we NEVER mutate an
+# existing place's url (that would relabel history); instead we find-or-create
+# a place for the new url and repoint the bookmark's fk at it, adjusting
+# foreign_count. Firefox's url_hash is reproduced exactly (verified against the
+# live db, see _assert_hash_sane). Login/auth/session redirect targets are
+# excluded — they're artifacts of the unauthenticated health check, and
+# applying them would replace good bookmarks with login pages.
+
+REDIRECTS_JSON = os.path.expanduser("~/bookmark-triage-redirects.json")
+REDIRECTS_UNDO = os.path.expanduser("~/bookmark-triage-redirects-undo.json")
+
+# Mozilla golden-ratio rolling string hash (mfbt/HashFunctions.h).
+_GR32 = 0x9E3779B9
+
+
+def _hashstring(s):
+    h = 0
+    for b in s.encode("utf-8"):
+        h = (_GR32 * (((h << 5 | h >> 27) & 0xFFFFFFFF) ^ b)) & 0xFFFFFFFF
+    return h
+
+
+def places_url_hash(url):
+    # Firefox moz_places.url_hash: (hash(scheme)&0xFFFF)<<32 | (hash(url)&0xFFFFFFFF)
+    scheme = url.split(":", 1)[0]
+    return ((_hashstring(scheme) & 0xFFFF) << 32) | (_hashstring(url) & 0xFFFFFFFF)
+
+
+def _rev_host(url):
+    m = re.match(r"https?://([^/:]+)", url)
+    return ((m.group(1) if m else "").lower()[::-1]) + "."
+
+
+# Redirect targets we must NOT follow: bot got bounced to a login/auth/session
+# page; the original url works fine in the user's logged-in browser.
+_REDIRECT_SKIP = re.compile(
+    r"/(login|signin|sign[_-]?in|auth|oauth2?|sso|sessions/new|users/login|"
+    r"realms/|accounts/|challenge/)"
+    r"|[?&](return_?to|redirect_uri|session_key|state|client_id|callback)=",
+    re.I)
+
+
+def redirect_is_safe(new_url):
+    return not _REDIRECT_SKIP.search(new_url)
+
+
+def redirect_category(old, new):
+    o, n = old.rstrip("/"), new.rstrip("/")
+    od = re.match(r"https?://([^/]+)", old).group(1)
+    nd = re.match(r"https?://([^/]+)", new).group(1)
+    if o == n:
+        return "trailing-slash"
+    if old.replace("http://", "https://", 1).rstrip("/") == n:
+        return "http->https"
+    if od == nd:
+        return "path/query change"
+    return "domain change"
+
+
+def _find_or_create_origin(con, url):
+    m = re.match(r"(https?)://([^/]+)", url)
+    prefix, host = m.group(1) + "://", m.group(2)
+    row = con.execute("SELECT id FROM moz_origins WHERE prefix=? AND host=?",
+                      (prefix, host)).fetchone()
+    if row:
+        return row[0]
+    cur = con.execute("INSERT INTO moz_origins(prefix,host,frecency,"
+                      "recalc_frecency,recalc_alt_frecency) VALUES(?,?,0,1,1)",
+                      (prefix, host))
+    return cur.lastrowid
+
+
+def _find_or_create_place(con, url):
+    h = places_url_hash(url)
+    row = con.execute("SELECT id FROM moz_places WHERE url_hash=? AND url=?",
+                      (h, url)).fetchone()
+    if row:
+        return row[0]
+    origin = _find_or_create_origin(con, url)
+    cur = con.execute(
+        "INSERT INTO moz_places(url,title,rev_host,visit_count,hidden,typed,"
+        "frecency,guid,foreign_count,url_hash,origin_id,recalc_frecency,"
+        "recalc_alt_frecency) VALUES(?,NULL,?,0,0,0,-1,?,0,?,?,1,1)",
+        (url, _rev_host(url), _new_guid(), h, origin))
+    return cur.lastrowid
+
+
+def _assert_hash_sane(places_path):
+    # Refuse to write unless our url_hash reproduces a real row's stored hash.
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+    shutil.copy(places_path, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        rows = con.execute("SELECT url, url_hash FROM moz_places "
+                           "WHERE url_hash>0 AND length(url)<150 LIMIT 50").fetchall()
+        con.close()
+    finally:
+        os.unlink(tmp)
+    if not rows or any(places_url_hash(u) != h for u, h in rows):
+        sys.exit("url_hash self-check FAILED — refusing to write moz_places.")
+
+
+def load_bookmark_places(places_path, include_other):
+    # {url: [(bookmark_id, place_id)]} for every http(s) bookmark.
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+    shutil.copy(places_path, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        where_excl = "" if include_other else UNFILED_EXCL
+        rows = con.execute(f"""
+            SELECT b.id, b.fk, p.url
+            FROM moz_bookmarks b
+            JOIN moz_places p ON b.fk = p.id
+            JOIN moz_bookmarks par ON b.parent = par.id
+            WHERE b.type=1 AND p.url GLOB 'http*://*'{where_excl}{TAGS_EXCL}
+        """).fetchall()
+        con.close()
+    finally:
+        os.unlink(tmp)
+    d = defaultdict(list)
+    for bid, fk, url in rows:
+        d[url].append((bid, fk))
+    return d
+
+
+def plan_redirects(pairs, bm_by_url):
+    # pairs: [(old_url, new_url)]. Returns (moves, n_skipped_login).
+    moves, skipped = [], 0
+    for old, new in pairs:
+        if old not in bm_by_url or old == new:
+            continue
+        if not redirect_is_safe(new):
+            skipped += 1
+            continue
+        cat = redirect_category(old, new)
+        for bid, pid in bm_by_url[old]:
+            moves.append({"bid": bid, "old": old, "old_pid": pid,
+                          "new": new, "cat": cat})
+    return moves, skipped
+
+
+def render_redirects_section(moves, skipped):
+    out = []
+    w = out.append
+    by_cat = defaultdict(list)
+    for m in moves:
+        by_cat[m["cat"]].append(m)
+    w("\n## ↻ Proposed redirect updates")
+    w(f"_{len(moves)} bookmark(s) to repoint · {skipped} login/auth target(s) "
+      f"skipped as unsafe_")
+    w("")
+    w("Each bookmark's URL is updated to where it now redirects. Login/session "
+      "targets are excluded. Review, delete any you reject from "
+      f"`{REDIRECTS_JSON}`, then run `--fix-redirects-apply`.")
+    w("")
+    for cat in sorted(by_cat):
+        items = by_cat[cat]
+        w(f"### {cat} ({len(items)})")
+        for m in sorted(items, key=lambda m: m["old"]):
+            w(f"- <{m['old']}>")
+            w(f"    -> <{m['new']}>")
+        w("")
+    return "\n".join(out)
+
+
+def apply_redirects(places_path, moves, quiet):
+    if firefox_running(places_path):
+        sys.exit("Firefox is running with this profile — close it first, "
+                 "then re-run --fix-redirects-apply.")
+    if not moves:
+        log("no redirect updates to apply.", quiet)
+        return
+    _assert_hash_sane(places_path)
+    backup_db(places_path, quiet)
+    now_us = int(time.time() * 1_000_000)
+    undo = []
+    con = sqlite3.connect(places_path)
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        place_for = {}
+        for m in moves:
+            new = m["new"]
+            if new not in place_for:
+                place_for[new] = _find_or_create_place(con, new)
+            dest = place_for[new]
+            cur = con.execute("SELECT fk FROM moz_bookmarks WHERE id=?",
+                              (m["bid"],)).fetchone()
+            if not cur:
+                continue
+            old_fk = cur[0]
+            if old_fk == dest:
+                continue
+            undo.append({"bid": m["bid"], "old_fk": old_fk})
+            con.execute("UPDATE moz_bookmarks SET fk=?, lastModified=?, "
+                        "syncChangeCounter=syncChangeCounter+1 WHERE id=?",
+                        (dest, now_us, m["bid"]))
+            con.execute("UPDATE moz_places SET foreign_count=foreign_count+1 "
+                        "WHERE id=?", (dest,))
+            con.execute("UPDATE moz_places SET foreign_count=MAX(0,foreign_count-1) "
+                        "WHERE id=?", (old_fk,))
+        con.commit()
+    finally:
+        con.close()
+    with open(REDIRECTS_UNDO, "w") as f:
+        json.dump(undo, f)
+    log(f"  updated {len(undo)} bookmark URL(s); undo map -> {REDIRECTS_UNDO}", quiet)
+    log("done. restart Firefox to see the updated URLs.", quiet)
+
+
+def run_redirects(places_path, pairs, do_apply, quiet, report_path):
+    if do_apply:
+        if not os.path.exists(REDIRECTS_JSON):
+            sys.exit(f"no approved list at {REDIRECTS_JSON} — run --fix-redirects first.")
+        with open(REDIRECTS_JSON) as f:
+            moves = json.load(f)
+        log(f"applying {len(moves)} approved redirect update(s)", quiet)
+        apply_redirects(places_path, moves, quiet)
+        return
+    bm = load_bookmark_places(places_path, include_other=False)
+    moves, skipped = plan_redirects(pairs, bm)
+    with open(report_path, "a") as f:
+        f.write("\n" + render_redirects_section(moves, skipped) + "\n")
+    with open(REDIRECTS_JSON, "w") as f:
+        json.dump(moves, f, indent=1)
+    log("", quiet)
+    log(f"redirect plan: {len(moves)} bookmark(s) to repoint, "
+        f"{skipped} login/auth skipped (details in {report_path})", quiet)
+    log(f"approved list -> {REDIRECTS_JSON}; trim it, then --fix-redirects-apply.",
+        quiet)
+
+
+# ============================================================
+# AUDIT: which bookmarked tools are actually adopted?
+# ============================================================
+# Cross-references each tool-folder GitHub bookmark against the system: is it an
+# installed package, a binary on PATH, a loaded nvim/zsh plugin, named in
+# ~/.config, or used in shell history? Zero traces => "aspirational" (saved,
+# never integrated). Optional Gemma pass tags each aspirational tool
+# integrate/superseded/toy/reference; apply sweeps them into Should Integrate/<v>.
+
+TOOL_FOLDERS = {"CLI", "TUI", "GUI", "Utilities", "Applications"}
+AUDIT_JSON = os.path.expanduser("~/bookmark-triage-audit.json")
+AUDIT_UNDO = os.path.expanduser("~/bookmark-triage-audit-undo.json")
+VERDICT_SUBFOLDER = {
+    "integrate": "Worth Integrating", "superseded": "Superseded",
+    "toy": "Toys", "reference": "Reference & Plugins", "?": "Review",
+}
+
+
+def _audit_signals():
+    pkgs = (set(subprocess.run(["pacman", "-Qq"], capture_output=True,
+                               text=True).stdout.split())
+            if shutil.which("pacman") else set())
+
+    def corpus(base, mb=512_000):
+        b = []
+        if os.path.isdir(base):
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+                for f in files:
+                    b.append(f.lower())
+                    p = os.path.join(root, f)
+                    try:
+                        if os.path.getsize(p) > mb:
+                            continue
+                        b.append(open(p, errors="ignore").read().lower())
+                    except OSError:
+                        pass
+        return "\n".join(b)
+
+    cfg = corpus(os.path.expanduser("~/.config"))
+    cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    hp = os.path.join(cache, "zsh", "zhistory")
+    hist = open(hp, errors="ignore").read().lower() if os.path.exists(hp) else ""
+    lazy = {os.path.basename(p).lower()
+            for p in glob.glob(os.path.expanduser("~/.local/share/nvim/lazy/*"))}
+    zinit = {os.path.basename(p).lower()
+             for p in glob.glob(os.path.expanduser("~/.local/share/zinit/plugins/*"))}
+    return pkgs, cfg, hist, lazy, zinit
+
+
+def adoption_signals(repo, sig):
+    pkgs, cfg, hist, lazy, zinit = sig
+    short = repo.split("/")[1]
+    name = re.sub(r"\.git$", "", short.lower())
+    cand = re.sub(r"(-rs|-cli|-bin|-git|\.nvim|\.vim|-tui|-app)$", "", name)
+    owner = repo.split("/")[0].lower()
+
+    def word(c, t):
+        return len(c) >= 3 and re.search(r"(?<![\w-])" + re.escape(c) + r"(?![\w-])", t)
+
+    def pkg_hit(c):
+        return c in pkgs or any(p == c or p.startswith(c + "-") or p.endswith("-" + c)
+                                for p in pkgs)
+    hits = []
+    if pkg_hit(cand) or pkg_hit(name):
+        hits.append("pkg")
+    if shutil.which(cand) or shutil.which(name):
+        hits.append("path")
+    if short.lower() in lazy or name in lazy:
+        hits.append("nvim")
+    if f"{owner}---{name}" in zinit or f"{owner}---{short.lower()}" in zinit:
+        hits.append("zinit")
+    if word(cand, cfg):
+        hits.append("config")
+    if len(cand) >= 4 and word(cand, hist):
+        hits.append("hist")
+    return hits
+
+
+def gemma_verdict(repos, gh_meta, model, quiet):
+    SYS = ("You assess developer tools (GitHub repos) a user bookmarked but never "
+           "installed or configured. For each output 'verdict' one of exactly: "
+           "integrate, superseded, toy, reference. integrate=useful standalone tool "
+           "worth setting up; superseded=a more standard/popular tool does this; "
+           "toy=novelty/fun, little utility; reference=not an installable tool "
+           "(guide, library, editor/shell plugin, snippets). 'note' under 10 words.")
+    out = {}
+    done = 0
+    for batch in chunks(repos, 18):
+        lines = [f"- {r} | {gh_meta.get(r, {}).get('lang') or ''} | "
+                 f"{','.join(gh_meta.get(r, {}).get('topics', [])[:6])} | "
+                 f"{(gh_meta.get(r, {}).get('description') or '')[:120]}" for r in batch]
+        usr = ('Classify each. JSON only: {"verdicts":{"owner/repo":'
+               '{"verdict":"...","note":"..."}}}\n\n' + "\n".join(lines))
+        payload = {"model": model, "messages": [{"role": "system", "content": SYS},
+                   {"role": "user", "content": usr}], "format": "json",
+                   "stream": False, "think": False, "keep_alive": "5m",
+                   "options": {"temperature": 0}}
+        try:
+            req = urllib.request.Request(OLLAMA_CHAT, data=json.dumps(payload).encode(),
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=180) as r:
+                content = json.load(r)["message"]["content"]
+            for k, v in (json.loads(content).get("verdicts") or {}).items():
+                out[k] = v
+        except Exception as e:                          # noqa: BLE001
+            log(f"  gemma verdict batch failed: {type(e).__name__}", quiet)
+        done += len(batch)
+        log(f"  gemma {min(done, len(repos))}/{len(repos)}", quiet)
+
+    def norm(v):
+        if isinstance(v, dict):
+            return (v.get("verdict") or "?"), str(v.get("note") or "")[:60]
+        if isinstance(v, str):
+            return v, ""
+        return "?", ""
+    return {r: norm(out.get(r)) for r in repos}
+
+
+def render_audit_section(adopted, aspir_plan):
+    out = []
+    w = out.append
+    by_v = defaultdict(list)
+    for m in aspir_plan:
+        by_v[m["verdict"]].append(m)
+    n_aspir = len({m["repo"] for m in aspir_plan})
+    w("\n## ⚒ Tool adoption audit")
+    w(f"_{len(adopted)} adopted (installed / configured / used) · {n_aspir} "
+      f"aspirational (no system trace)_")
+    w("")
+    w("Aspirational = bookmarked tool with no package, binary, plugin, config, or "
+      "history trace. Verdict by Gemma. Apply sweeps these into "
+      "`Should Integrate/<verdict>`.")
+    w("")
+    for vd in ["integrate", "superseded", "toy", "reference", "?"]:
+        items = by_v.get(vd)
+        if not items:
+            continue
+        w(f"### {vd} -> {VERDICT_SUBFOLDER[vd]} ({len({m['repo'] for m in items})})")
+        for m in sorted(items, key=lambda m: m["repo"]):
+            note = f" — {m['note']}" if m["note"] else ""
+            w(f"- `{m['repo']}` _(from {m['from']})_{note}")
+        w("")
+    return "\n".join(out)
+
+
+def apply_audit(places_path, plan, quiet):
+    if firefox_running(places_path):
+        sys.exit("Firefox is running with this profile — close it first, "
+                 "then re-run --audit-apply.")
+    if not plan:
+        log("nothing to sweep.", quiet)
+        return
+    backup_db(places_path, quiet)
+    now_us = int(time.time() * 1_000_000)
+    con = sqlite3.connect(places_path)
+    undo = []
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        si = con.execute(
+            "SELECT id FROM moz_bookmarks WHERE type=2 AND lower(title)='should integrate' "
+            "ORDER BY (SELECT count(*) FROM moz_bookmarks c WHERE c.parent=moz_bookmarks.id) "
+            "DESC LIMIT 1").fetchone()
+        if si:
+            si = si[0]
+        else:                                            # create under Bookmarks Menu
+            menu = con.execute("SELECT id FROM moz_bookmarks WHERE guid='menu________'"
+                               ).fetchone()[0]
+            pos = con.execute("SELECT COALESCE(MAX(position)+1,0) FROM moz_bookmarks "
+                              "WHERE parent=?", (menu,)).fetchone()[0]
+            si = con.execute("INSERT INTO moz_bookmarks(type,fk,parent,position,title,"
+                             "dateAdded,lastModified,guid,syncStatus,syncChangeCounter) "
+                             "VALUES(2,NULL,?,?, 'Should Integrate',?,?,?,1,1)",
+                             (menu, pos, now_us, now_us, _new_guid())).lastrowid
+        subcache = {}
+
+        def ensure_sub(title):
+            if title in subcache:
+                return subcache[title]
+            row = con.execute("SELECT id FROM moz_bookmarks WHERE type=2 AND parent=? "
+                              "AND title=?", (si, title)).fetchone()
+            if row:
+                subcache[title] = row[0]
+                return row[0]
+            pos = con.execute("SELECT COALESCE(MAX(position)+1,0) FROM moz_bookmarks "
+                              "WHERE parent=?", (si,)).fetchone()[0]
+            fid = con.execute("INSERT INTO moz_bookmarks(type,fk,parent,position,title,"
+                              "dateAdded,lastModified,guid,syncStatus,syncChangeCounter) "
+                              "VALUES(2,NULL,?,?,?,?,?,?,1,1)",
+                              (si, pos, title, now_us, now_us, _new_guid())).lastrowid
+            subcache[title] = fid
+            return fid
+
+        for m in plan:
+            dest = ensure_sub(m["sub"])
+            cur = con.execute("SELECT parent FROM moz_bookmarks WHERE id=?",
+                              (m["bid"],)).fetchone()
+            if not cur or cur[0] == dest:
+                continue
+            undo.append({"bid": m["bid"], "old_parent": cur[0]})
+            pos = con.execute("SELECT COALESCE(MAX(position)+1,0) FROM moz_bookmarks "
+                              "WHERE parent=?", (dest,)).fetchone()[0]
+            con.execute("UPDATE moz_bookmarks SET parent=?, position=?, lastModified=?, "
+                        "syncChangeCounter=syncChangeCounter+1 WHERE id=?",
+                        (dest, pos, now_us, m["bid"]))
+        con.commit()
+    finally:
+        con.close()
+    with open(AUDIT_UNDO, "w") as f:
+        json.dump(undo, f)
+    log(f"  swept {len(undo)} bookmark(s) into Should Integrate/<verdict>; "
+        f"undo map -> {AUDIT_UNDO}", quiet)
+    log("done. restart Firefox.", quiet)
+
+
+def run_audit(places_path, gh_meta, use_gemma, gemma_model, do_apply, quiet,
+              report_path):
+    if do_apply:
+        if not os.path.exists(AUDIT_JSON):
+            sys.exit(f"no audit plan at {AUDIT_JSON} — run --audit first.")
+        with open(AUDIT_JSON) as f:
+            plan = json.load(f)
+        log(f"sweeping {len(plan)} aspirational bookmark(s) into Should Integrate", quiet)
+        apply_audit(places_path, plan, quiet)
+        return
+
+    sig = _audit_signals()
+    gh = load_github_bookmarks(places_path)
+    by_repo = defaultdict(list)
+    for bid, url, repo, pid, folder in gh:
+        if folder in TOOL_FOLDERS:
+            by_repo[repo].append((bid, folder))
+    adopted, aspir = [], []
+    for repo, insts in by_repo.items():
+        if adoption_signals(repo, sig):
+            adopted.append(repo)
+        else:
+            aspir.append((repo, insts))
+    verdicts = (gemma_verdict([r for r, _ in aspir], gh_meta, gemma_model, quiet)
+                if use_gemma else {r: ("?", "") for r, _ in aspir})
+    plan = []
+    for repo, insts in aspir:
+        vd, note = verdicts.get(repo, ("?", ""))
+        for bid, folder in insts:
+            plan.append({"bid": bid, "repo": repo, "from": folder, "verdict": vd,
+                         "note": note, "sub": VERDICT_SUBFOLDER.get(vd, "Review")})
+    with open(report_path, "a") as f:
+        f.write("\n" + render_audit_section(adopted, plan) + "\n")
+    with open(AUDIT_JSON, "w") as f:
+        json.dump(plan, f, indent=1)
+    log("", quiet)
+    log(f"audit: {len(adopted)} adopted, {len(aspir)} aspirational "
+        f"({len(plan)} bookmarks) — details in {report_path}", quiet)
+    log(f"plan -> {AUDIT_JSON}; trim it, then --audit-apply to sweep them.", quiet)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    ap = argparse.ArgumentParser(description="Triage Firefox bookmarks.")
+    ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
+                    help=f"markdown output path (default: {DEFAULT_OUTPUT})")
+    ap.add_argument("--profile", help="Firefox profile dir name (default: auto-detect)")
+    ap.add_argument("--json", help="also dump enriched data to this JSON file")
+    ap.add_argument("--stale-years", type=int, default=2,
+                    help="flag repos with no push in N years (default: 2)")
+    ap.add_argument("--skip-links", action="store_true",
+                    help="only triage GitHub repos; skip the HTTP health check")
+    ap.add_argument("--include-other", action="store_true",
+                    help="include the 'Other Bookmarks' subtree (skipped by default)")
+    ap.add_argument("--apply", action="store_true",
+                    help="delete confirmed-dead bookmarks from places.sqlite "
+                         "(backs up first; refuses while Firefox is running)")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="with --apply, also collapse duplicate URLs to one bookmark")
+    ap.add_argument("--organize", action="store_true",
+                    help="propose regrouping GitHub bookmarks from catch-all "
+                         "folders into your existing topic folders (appends a "
+                         "plan to the report; changes nothing)")
+    ap.add_argument("--organize-apply", action="store_true",
+                    help="perform the proposed GitHub reorg moves "
+                         "(backs up + undo map; refuses while Firefox is running)")
+    ap.add_argument("--gemma", action="store_true",
+                    help="use a local Ollama model to classify repos the keyword "
+                         "rules can't place (for --organize/--organize-apply)")
+    ap.add_argument("--gemma-model", default=GEMMA_MODEL,
+                    help=f"Ollama model for --gemma (default: {GEMMA_MODEL})")
+    ap.add_argument("--new-folders", default="",
+                    help="comma-separated extra topic folders to offer as "
+                         "classification targets and create on demand "
+                         "(e.g. 'Games,Fonts'); most useful with --gemma")
+    ap.add_argument("--fix-redirects", action="store_true",
+                    help="propose repointing bookmarks to where they now "
+                         "redirect (login/auth targets excluded); writes a plan "
+                         "+ approved-list JSON, changes nothing")
+    ap.add_argument("--fix-redirects-apply", action="store_true",
+                    help="apply the approved redirect updates from the JSON list "
+                         "(backs up + undo map; refuses while Firefox is running)")
+    ap.add_argument("--audit", action="store_true",
+                    help="audit which bookmarked tools you've actually adopted "
+                         "(pacman/PATH/config/history/plugins); writes a plan. "
+                         "Add --gemma to tag aspirational tools by verdict")
+    ap.add_argument("--audit-apply", action="store_true",
+                    help="sweep aspirational tools into Should Integrate/<verdict> "
+                         "subfolders (backs up + undo map; Firefox must be closed)")
+    ap.add_argument("--link-workers", type=int, default=LINK_WORKERS,
+                    help=f"concurrent HTTP checks (default: {LINK_WORKERS})")
+    ap.add_argument("--link-timeout", type=int, default=LINK_TIMEOUT,
+                    help=f"per-request timeout seconds (default: {LINK_TIMEOUT})")
+    ap.add_argument("--quiet", action="store_true", help="suppress progress output")
+    args = ap.parse_args()
+
+    if not shutil.which("gh"):
+        sys.exit("`gh` CLI not found - install it and run `gh auth login`")
+
+    places = find_profile(args.profile)
+    rows = extract(places, args.include_other, args.quiet)
+    if not rows:
+        sys.exit("no bookmarks found")
+
+    repos = sorted({gh_repo(u) for u, *_ in rows if gh_repo(u)})
+    other = sorted({u for u, *_ in rows if not gh_repo(u)})
+    log(f"-> {len(repos)} github repos, {len(other)} other links", args.quiet)
+
+    gh_meta = enrich_github(repos, args.quiet) if repos else {}
+    health = {}
+    if not args.skip_links and other:
+        health = check_links(other, args.link_workers, args.link_timeout, args.quiet)
+
+    report = render(rows, gh_meta, health, args.stale_years)
+    with open(args.output, "w") as f:
+        f.write(report)
+    log(f"wrote {args.output}", args.quiet)
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"github": gh_meta, "links": health}, f)
+        log(f"wrote {args.json}", args.quiet)
+
+    # ---- prune: dead non-GitHub links + dead/renamed GitHub repos ----
+    dead_urls = {u for u, v in health.items() if v.get("bucket") == "dead"}
+    dead_repos = {r for r in repos if gh_meta.get(r, {}).get("status") == "dead"}
+    for u, *_ in rows:
+        repo = gh_repo(u)
+        if repo and repo in dead_repos:
+            dead_urls.add(u)
+
+    if args.dedupe and not args.apply:
+        log("note: --dedupe has no effect without --apply", args.quiet)
+    id_rows = load_bookmark_ids(places, args.include_other)
+    run_apply(places, id_rows, dead_urls, args.dedupe, args.apply, args.quiet)
+
+    if args.organize or args.organize_apply:
+        extra = [f.strip() for f in args.new_folders.split(",") if f.strip()]
+        run_organize(places, gh_meta, args.organize_apply, args.quiet, args.output,
+                     use_gemma=args.gemma, gemma_model=args.gemma_model,
+                     extra_folders=extra)
+
+    if args.fix_redirects or args.fix_redirects_apply:
+        pairs = [(u, v["final"]) for u, v in health.items() if v.get("final")]
+        run_redirects(places, pairs, args.fix_redirects_apply, args.quiet,
+                      args.output)
+
+    if args.audit or args.audit_apply:
+        run_audit(places, gh_meta, args.gemma, args.gemma_model, args.audit_apply,
+                  args.quiet, args.output)
+
+
+if __name__ == "__main__":
+    main()
