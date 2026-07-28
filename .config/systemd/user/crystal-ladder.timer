@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly crystal-battle ladder run (01:00)
+
+[Timer]
+# Fires at 01:00 local nightly. Persistent=false on purpose: if the box is off
+# at 01:00 we SKIP rather than run a catch-up during the day when you're using
+# it. Flip to Persistent=true if you'd rather it catch up on next boot.
+OnCalendar=*-*-* 01:00:00
+RandomizedDelaySec=300
+Persistent=false
+
+[Install]
+WantedBy=timers.target
