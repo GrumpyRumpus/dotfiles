@@ -1,0 +1,12 @@
+#!/bin/bash
+# Recovery for workspaces stranded on a phantom output (DP link drop on
+# lock/DPMS, or a leftover virtual display). Removes every virtual output —
+# identified by empty make+model, which no physical monitor has — then
+# re-applies workspace rules via handle-monitors.sh. Workspaces migrate back
+# to the real monitor automatically.
+hyprctl monitors -j | jq -r '.[] | select(.make == "" and .model == "") | .name' |
+while read -r m; do
+    echo "removing virtual output: $m"
+    hyprctl output remove "$m"
+done
+exec "$HOME/.config/hypr/scripts/handle-monitors.sh"
