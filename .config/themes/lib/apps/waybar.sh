@@ -1,6 +1,26 @@
 #!/bin/bash
 # Waybar theme handler
 
+# Restart waybar to pick up structural config changes.
+#
+# Where waybar.service is running, systemd owns the process: killing it here
+# gets it restarted a second later anyway, and the bare instance this used to
+# spawn would leave a duplicate bar on screen. Only fall back to kill+relaunch
+# when nothing is supervising it.
+restart_waybar() {
+    if systemctl --user is-active --quiet waybar.service 2>/dev/null; then
+        systemctl --user restart waybar.service
+        return
+    fi
+
+    if pgrep -x waybar >/dev/null; then
+        pkill -x waybar 2>/dev/null
+        sleep 0.3
+        waybar &>/dev/null &
+        disown
+    fi
+}
+
 apply_waybar() {
     local theme="$1"
     local palette_path="$2"
@@ -21,12 +41,7 @@ apply_waybar() {
 
     if $applied; then
         # Full restart needed for structural changes
-        if pgrep -x waybar >/dev/null; then
-            pkill -x waybar 2>/dev/null
-            sleep 0.3
-            waybar &>/dev/null &
-            disown
-        fi
+        restart_waybar
         report_ok "waybar"
     else
         report_skip "waybar (no theme file)"
