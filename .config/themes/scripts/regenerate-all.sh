@@ -64,6 +64,9 @@ for theme in "${themes[@]}"; do
         printf "  ✓ %-12s " "$theme"
         print_gradient "$theme"
         echo ""
+        # Per-theme output is only shown on failure, which would bury override
+        # drift warnings in the one path that regenerates every theme.
+        grep -h "WARNING:" "$tmpdir/$theme.log" 2>/dev/null | sed "s/^/    /"
     fi
 done
 

@@ -268,6 +268,16 @@ for template in "$TEMPLATES_DIR"/*.tmpl; do
             # Use override file directly (still run envsubst for color variables)
             echo "  -> $filename (override)"
             envsubst "$VARS" < "$override" > "$output"
+
+            # Overrides replace the template wholesale, so any variable added to
+            # the template later is simply absent here -- and Hyprland only
+            # complains at apply time, per missing variable. Flag the drift.
+            missing=$(comm -23 \
+                <(grep -oP '^\$\K[a-zA-Z_0-9]+(?=\s*=)' "$template" 2>/dev/null | sort -u) \
+                <(grep -oP '^\$\K[a-zA-Z_0-9]+(?=\s*=)' "$override" 2>/dev/null | sort -u))
+            if [[ -n "$missing" ]]; then
+                echo "     WARNING: $filename override is missing $(echo "$missing" | wc -l) var(s) the template defines: $(echo $missing | tr '\n' ' ')" >&2
+            fi
         else
             # Use template
             echo "  -> $filename"
