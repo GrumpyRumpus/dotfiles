@@ -131,6 +131,7 @@ session/
 .config/qt5ct/colors/current.conf
 .config/qt6ct/colors/current.conf
 .config/spotify-player/theme.toml
+.config/starship/starship.toml
 .config/hypr/appearance/hyprlock-colors.conf
 .config/dunst/icons/
 
