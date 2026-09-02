@@ -87,6 +87,19 @@ session/
 .local/share/pomodoro/media-player.log
 
 # ============================================================================
+# CLAUDE CODE
+# ============================================================================
+# Runtime state: caches, session transcripts, shell snapshots, per-project
+# memory, telemetry. Not a blanket .claude/ ignore -- settings, hooks and the
+# statusline scripts are real config, and statusline-current.sh is already
+# tracked. .credentials.json is covered by the *credentials* rule above.
+.claude.json
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+!.claude/statusline*.sh
+
+# ============================================================================
 # ALLOW ESSENTIAL DOTFILES
 # ============================================================================
 !.gitignore
