@@ -9,9 +9,17 @@ if ! command -v nvidia-smi &>/dev/null; then
 	exit 0
 fi
 
-out=$(nvidia-smi --query-gpu=power.draw,power.limit,temperature.gpu,fan.speed,utilization.gpu \
-	--format=csv,noheader,nounits 2>/dev/null)
-if [[ -z "$out" ]]; then
+# With no card present nvidia-smi prints "NVIDIA-SMI has failed ..." on STDOUT,
+# not stderr, and exits 9. So 2>/dev/null hides nothing and a -z test passes,
+# leaving the error text to be parsed as CSV -- that is what filled the journal
+# with `printf: NVIDIA-SMI: invalid number`. Gate on the exit status instead,
+# then confirm the first field really is a number.
+if ! out=$(nvidia-smi --query-gpu=power.draw,power.limit,temperature.gpu,fan.speed,utilization.gpu \
+	--format=csv,noheader,nounits 2>/dev/null); then
+	printf '{"text": "", "tooltip": "no NVIDIA GPU"}\n'
+	exit 0
+fi
+if [[ -z "$out" || ! "${out%%,*}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
 	printf '{"text": "<span color=\\"%s\\">N/A</span>", "tooltip": "nvidia-smi query failed"}\n' "$COLOR_ERR"
 	exit 0
 fi
