@@ -8,8 +8,21 @@
 RULES_CONF="$HOME/.config/hypr/environment/rules.conf"
 WAYBAR_CONF="$HOME/.config/waybar/config.jsonc"
 
-monitor_count() { hyprctl monitors -j | jq 'length'; }
-primary_monitor() { hyprctl monitors -j | jq -r '.[0].name'; }
+# HEADLESS-* are Hyprland's fallback outputs, created while the real monitor's
+# DP link is down (lock/DPMS/suspend). Never count them or pin workspaces to
+# them, and remove them once a real monitor is back.
+real_monitors() {
+    hyprctl monitors -j | jq '[.[] | select(.name | startswith("HEADLESS") | not)]'
+}
+monitor_count() { real_monitors | jq 'length'; }
+primary_monitor() { real_monitors | jq -r '.[0].name'; }
+
+# Signature of the monitor set we last applied. A DP link that flaps on
+# dpms-off fires monitoradded/monitorremoved repeatedly without the real
+# monitor set ever changing; reapplying (and reloading) on each one churns
+# wl_output globals and is what makes hyprlock abort. Only do work on a
+# genuine change.
+LAST_SIG=""
 
 # ---- Hyprland workspace rules ----
 apply_workspace_rules() {
@@ -71,8 +84,36 @@ apply_waybar_workspaces() {
 }
 
 apply_config() {
-    local count
-    count=$(monitor_count)
+    local monitors real count headless sig
+    monitors=$(hyprctl monitors -j)
+    real=$(jq '[.[] | select(.name | startswith("HEADLESS") | not)]' <<<"$monitors")
+    count=$(jq 'length' <<<"$real")
+
+    if [ "$count" -eq 0 ]; then
+        # Only fallback outputs exist (screen asleep): leave rules untouched.
+        return
+    fi
+
+    headless=$(jq -r '.[] | select(.name | startswith("HEADLESS")) | .name' <<<"$monitors")
+    sig=$(jq -r '[.[].name] | sort | join(",")' <<<"$real")
+
+    # Nothing to clean up and the same real monitors as last time: no-op.
+    if [ -z "$headless" ] && [ "$sig" = "$LAST_SIG" ]; then
+        return
+    fi
+
+    if [ -n "$headless" ]; then
+        while read -r m; do
+            [ -n "$m" ] && hyprctl output remove "$m"
+        done <<<"$headless"
+    fi
+
+    # Removing fallbacks was the only change: don't rewrite configs or reload.
+    if [ "$sig" = "$LAST_SIG" ]; then
+        return
+    fi
+    LAST_SIG="$sig"
+
     apply_workspace_rules "$count"
     apply_waybar_workspaces "$count"
 
