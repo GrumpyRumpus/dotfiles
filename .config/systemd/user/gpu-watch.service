@@ -1,0 +1,13 @@
+[Unit]
+Description=Sample GPU telemetry to CSV for post-freeze forensics
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gpu-watch
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

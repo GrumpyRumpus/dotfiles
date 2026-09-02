@@ -1,0 +1,7 @@
+[Unit]
+Description=notify on crystal-ladder failure (OOM, crash — anything non-clean)
+
+[Service]
+Type=oneshot
+# %N of the failing unit is not passed through OnFailure; hardcode the name.
+ExecStart=/usr/bin/dunstify -u normal -a crystal-ladder "crystal-ladder died (auto-restart in 2min)" "usually an oom-kill at the cgroup cap; act only if it STAYS down — journalctl --user -u crystal-ladder.service -n 50"
