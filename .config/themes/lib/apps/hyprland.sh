@@ -1,6 +1,26 @@
 #!/bin/bash
 # Hyprland theme handler
 
+# Re-export the cursor vars from the freshly applied colors.conf.
+#
+# Anything the theme script spawns (waybar) is a child of that script, so it
+# inherits the invoking SHELL's environment -- not the compositor's. Hyprland's
+# `env =` lines only reach processes the compositor itself launches, so without
+# this waybar comes back carrying whatever cursor theme the terminal was
+# started with, and the cursor changes as you move onto the bar.
+export_cursor_env() {
+    local colors="$HOME/.config/hypr/appearance/colors.conf"
+    [[ -f "$colors" ]] || return 0
+
+    local ctheme csize
+    ctheme=$(grep '^\$cursor_theme' "$colors" | sed 's/.*= *//')
+    csize=$(grep '^\$cursor_size' "$colors" | sed 's/.*= *//')
+    [[ -n "$ctheme" ]] || return 0
+
+    export XCURSOR_THEME="$ctheme"  HYPRCURSOR_THEME="$ctheme"
+    export XCURSOR_SIZE="${csize:-24}"  HYPRCURSOR_SIZE="${csize:-24}"
+}
+
 apply_hyprland() {
     local theme="$1"
     if copy_to_current "$theme" "hypr-colors.conf"; then

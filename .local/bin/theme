@@ -99,9 +99,13 @@ cmd_set() {
 
     # Apply to all apps
     apply_kitty "$theme"
-    apply_waybar "$theme" "$palette_path"
     apply_rofi "$theme"
+    # Before waybar: apply_hyprland's `hyprctl reload` re-applies the `env =`
+    # lines, so $cursor_theme is current in the compositor env. waybar respawns
+    # from that env, and starting it first would leave it a theme behind.
     apply_hyprland "$theme"
+    export_cursor_env
+    apply_waybar "$theme" "$palette_path"
     apply_hyprlock "$theme"
     apply_hyprtoolkit "$theme"
     apply_lazygit "$theme"
