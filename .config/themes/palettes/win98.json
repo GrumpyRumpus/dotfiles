@@ -1,5 +1,5 @@
 {
-  "description": "Windows 98 \u2014 authentic grays, blended accents",
+  "description": "Windows 98 — authentic grays, blended accents",
   "style": {
     "corner_radius": 0,
     "border_width": 2,
@@ -103,5 +103,6 @@
     "lavender",
     "mauve",
     "pink"
-  ]
+  ],
+  "cursor": "Adwaita"
 }
