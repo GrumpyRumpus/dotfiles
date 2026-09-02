@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# gpu-watch: sample RTX 3090 telemetry for post-freeze forensics (Xid 79 investigation).
+# One CSV row per interval, fsynced immediately so the final row survives a hard lockup.
+set -uo pipefail
+
+LOG="${GPU_WATCH_LOG:-$HOME/gpu-watch/gpu-watch.csv}"
+INTERVAL="${GPU_WATCH_INTERVAL:-5}"
+PCI="${GPU_WATCH_PCI:-0000:01:00.0}"
+MAXBYTES=$((50 * 1024 * 1024))
+
+FIELDS=temperature.gpu,power.draw,power.limit,clocks.current.graphics,clocks.current.memory,utilization.gpu,utilization.memory,pstate,pcie.link.gen.current,pcie.link.width.current,clocks_event_reasons.hw_slowdown,clocks_event_reasons.sw_power_cap
+HEADER='time,status,temp_c,power_w,plimit_w,sm_mhz,mem_mhz,util_gpu,util_mem,pstate,link_gen,link_width,hw_slowdown,sw_power_cap,sysfs_speed,sysfs_width,v12,v5,v33'
+BLANK=',,,,,,,,,,,'
+
+mkdir -p "$(dirname "$LOG")"
+[[ -s $LOG ]] || printf '%s\n' "$HEADER" >"$LOG"
+
+rail() { sensors 2>/dev/null | awk -v k="$1" '$1==k {gsub(/[^0-9.]/,"",$2); print $2; exit}'; }
+sysfs() { timeout 5 cat "/sys/bus/pci/devices/$PCI/$1" 2>/dev/null | tr -d ' ' | head -1; }
+
+last_epoch=
+while :; do
+    ts=$(date -Is)
+    now=$(date +%s)
+
+    # A suspend freezes this loop, so the first sample after resume looks like a
+    # failure. Mark the gap instead, or it reads as hours of dead GPU later on.
+    if [[ -n $last_epoch ]] && ((now - last_epoch > INTERVAL * 3)); then
+        printf '%s,GAP_%ss,%s,,,,,\n' "$ts" "$((now - last_epoch))" "$BLANK" >>"$LOG"
+    fi
+    last_epoch=$now
+
+    # timeout matters: a wedged GPU makes nvidia-smi hang forever, which would
+    # silently stop the logging exactly when the data becomes interesting.
+    if smi=$(timeout 10 nvidia-smi --query-gpu="$FIELDS" --format=csv,noheader,nounits 2>/dev/null) \
+        && [[ -n $smi ]]; then
+        status=ok
+        row=$(printf '%s' "$smi" | tr -d ' ')
+    else
+        status=SMI_FAIL # GPU is not answering - the row we actually care about
+        row=$BLANK
+    fi
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$ts" "$status" "$row" \
+        "$(sysfs current_link_speed)" "$(sysfs current_link_width)" \
+        "$(rail '+12V:')" "$(rail '+5V:')" "$(rail '+3.3V:')" >>"$LOG"
+
+    # Force it to disk now; a hard freeze never gets to flush the page cache.
+    sync -d "$LOG" 2>/dev/null || sync
+
+    if [[ $(stat -c %s "$LOG" 2>/dev/null || echo 0) -gt $MAXBYTES ]]; then
+        mv -f "$LOG" "$LOG.1"
+        printf '%s\n' "$HEADER" >"$LOG"
+    fi
+
+    sleep "$INTERVAL"
+done

@@ -1,0 +1,62 @@
+#!/bin/bash
+# Launch hyprlock, capture stderr, and RESTART it if it dies while still locked.
+#
+# Root cause (confirmed 2026-08-29): when the ViewSonic drops its DP link on
+# dpms-off, amdgpu fails link training and Hyprland churns wl_output globals
+# (real output removed -> HEADLESS fallback added -> removed -> real output
+# back). hyprlock races that and binds an already-dead global:
+#     wl_registry#10: error 0: global wl_output (98) is unavailable
+#     ASSERTION FAILED! [core] Disconnected from pollfd id 0
+#     at: line 414 in hyprlock.cpp
+# -> SIGABRT (rc 134), session left locked with no client = lockdead screen.
+#
+# We cannot fix the race from out here, but we can make it invisible: if
+# hyprlock dies abnormally while the session is still locked, bring it right
+# back. Needs misc:allow_session_lock_restore = true (set in general.conf).
+
+set -u
+LOG="$HOME/.local/state/hyprlock.log"
+MAX_RESTARTS=10          # give up rather than spin forever
+MIN_HEALTHY_SECS=120     # a run this long counts as healthy; reset the counter
+
+log() { echo "===== $(date -Is) $* =====" >> "$LOG"; }
+
+rotate() {
+    [[ -f "$LOG" ]] || return 0
+    (( $(stat -c %s "$LOG" 2>/dev/null || echo 0) > 1048576 )) && mv -f "$LOG" "$LOG.1"
+    return 0
+}
+
+attempts=0
+while :; do
+    rotate
+    log "hyprlock starting (attempt $((attempts + 1)))"
+    start=$SECONDS
+
+    hyprlock --verbose >> "$LOG" 2>&1
+    rc=$?
+    ran=$(( SECONDS - start ))
+
+    log "hyprlock exited rc=$rc after ${ran}s"
+
+    # Clean exit == user unlocked. Done.
+    (( rc == 0 )) && break
+
+    # Session no longer locked (someone unlocked another way). Done.
+    if ! hyprctl locked 2>/dev/null | grep -q true; then
+        log "session no longer locked; not restarting"
+        break
+    fi
+
+    # A long healthy run before the crash isn't a restart loop.
+    (( ran >= MIN_HEALTHY_SECS )) && attempts=0
+
+    attempts=$(( attempts + 1 ))
+    if (( attempts >= MAX_RESTARTS )); then
+        log "giving up after $attempts restarts -- lockdead screen will show"
+        break
+    fi
+
+    log "crashed while locked; restarting in 1s"
+    sleep 1
+done
