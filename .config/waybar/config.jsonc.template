@@ -13,11 +13,6 @@
   "passthrough": false,
   "gtk-layer-shell": true,
   "reload_style_on_change": true,
-  "output": [
-    "eDP-1",
-    "HDMI-A-1",
-    "DP-4"
-  ],
 
   // ============================================================
   // MODULE LAYOUT
@@ -94,7 +89,7 @@
     "on-scroll-up": "~/.config/waybar/scripts/workspace-scroll.sh up",
     "on-scroll-down": "~/.config/waybar/scripts/workspace-scroll.sh down",
     "persistent-workspaces": {
-      "DP-4": [1, 2, 3, 4, 5]
+      "DP-1": [1, 2, 3, 4, 5]
     },
     "sort-by-number": true,
     "tooltip": false
