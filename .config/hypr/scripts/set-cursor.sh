@@ -9,11 +9,22 @@ if [[ -f "$COLORS_CONF" ]]; then
     cursor_size=$(grep '^\$cursor_size' "$COLORS_CONF" | sed 's/.*= *//' || echo "24")
 
     if [[ -n "$cursor_theme" ]]; then
-        hyprctl setcursor "$cursor_theme" "${cursor_size:-24}"
-        # Also set env vars for toolkits
-        export XCURSOR_THEME="$cursor_theme"
-        export XCURSOR_SIZE="${cursor_size:-24}"
-        export HYPRCURSOR_THEME="$cursor_theme"
-        export HYPRCURSOR_SIZE="${cursor_size:-24}"
+        size="${cursor_size:-24}"
+
+        # Compositor-drawn cursor (desktop, and any surface that sets none).
+        hyprctl setcursor "$cursor_theme" "$size"
+
+        # GTK clients on Wayland take their cursor from xdg-desktop-portal-gtk,
+        # which proxies these gsettings keys — NOT gtk-3.0/settings.ini. Leave
+        # these unset and waybar falls back to 'default' -> Adwaita, so the whole
+        # cursor theme flips the moment you hover a clickable widget.
+        if command -v gsettings &>/dev/null; then
+            gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme"
+            gsettings set org.gnome.desktop.interface cursor-size "$size"
+        fi
+
+        # XWayland/Qt apps read XCURSOR_* from the env instead. Hyprland 0.56 has
+        # no runtime env setter (`hyprctl setenv` is not a request), so those are
+        # declared in environment/theme.conf where $cursor_theme is in scope.
     fi
 fi
