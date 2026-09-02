@@ -168,7 +168,7 @@ csakura/
 team-tools/
 gpu-watch/
 bookmark-triage-output/
-watch_[0-9]*/
+watch_[0-9]*
 # These have their own repos.
 .dotfiles/
 .todo.git/
