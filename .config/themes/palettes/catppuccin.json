@@ -92,5 +92,6 @@
   ],
   "style": {
     "border": "gradient"
-  }
+  },
+  "qt_color_scheme": "Catppuccin-Mocha.conf"
 }
