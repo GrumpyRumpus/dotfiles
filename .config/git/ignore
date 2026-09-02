@@ -38,6 +38,10 @@
 # Whole dir: config leaks host aliases and LAN IPs, known_hosts.old the rest.
 .ssh/
 
+# Version-pinned install symlinks, not config.
+.local/bin/claude
+.local/bin/oterm
+
 # ============================================================================
 # BACKUP & TEMPORARY FILES
 # ============================================================================
