@@ -25,6 +25,19 @@
 .docker/config.json
 .config/gh/hosts.yml
 
+# --- gaps found 2026-09-01: untracked AND unignored on a public repo ---
+# The .gnupg/.ssh rules above are anchored at $HOME and miss the XDG copies.
+.config/gnupg/
+.pki/
+.config/libaccounts-glib/
+.config/kdeconnect/
+# `.env` / `.env.*` above match only a file named exactly .env; this catches
+# pokeagent.env and friends.
+*.env
+.config/crystal-battle/
+# Whole dir: config leaks host aliases and LAN IPs, known_hosts.old the rest.
+.ssh/
+
 # ============================================================================
 # BACKUP & TEMPORARY FILES
 # ============================================================================
