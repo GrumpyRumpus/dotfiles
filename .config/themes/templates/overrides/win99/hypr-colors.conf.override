@@ -14,6 +14,8 @@ $accentAlpha = ${ACCENT_NOHASH}
 $accent_secondary = rgb(${ACCENT_SECONDARY_NOHASH})
 $accent_tertiary = rgb(${ACCENT_TERTIARY_NOHASH})
 $accent_bright = rgb(${ACCENT_BRIGHT_NOHASH})
+$accent_secondary_bright = rgb(${ACCENT_SECONDARY_BRIGHT_NOHASH})
+$accent_tertiary_bright = rgb(${ACCENT_TERTIARY_BRIGHT_NOHASH})
 
 # Text colors
 $text = rgb(${TEXT_NOHASH})
