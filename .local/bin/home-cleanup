@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+#
+# home-cleanup -- reclaim space under /home/wiz
+#
+# DEFAULTS TO DRY RUN. Nothing is deleted until you run it with DRY_RUN=0.
+#
+#   home-cleanup              # print what would happen
+#   DRY_RUN=0 home-cleanup    # actually do it
+#
+# Toggle individual sections with the SECTION FLAGS below. Safe to re-run:
+# already-deleted paths are skipped, and the live-process guards re-check.
+#
+# NOTE: /home is btrfs with snapper snapshots, so freed space shows up in
+# `du` immediately but in `df` only as snapshots age out (dailies ~7 days,
+# weeklies ~4 weeks). Judge the result with du, not df.
+#
+# First run 2026-07-28 took home from 218G to 83G. Still outstanding:
+#   - A4 firefox cache (1.6G) -- skipped, Firefox was running
+#   - F2 bench logs (2.8G)    -- skipped, ladder series was live
+# Every path was verified on 2026-07-28; the evidence is in the comments.
+
+set -euo pipefail
+
+DRY_RUN="${DRY_RUN:-1}"
+
+# ----------------------------- SECTION FLAGS -----------------------------
+DO_CACHES=1        # A. regenerable caches                        ~79 GB
+DO_STALE_XDG=1     # B. pre-XDG duplicate toolchain dirs          ~5.9 GB
+DO_EXTRAS=1        # C. huggingface cache + AIRI pkg (you chose)  ~16 GB
+DO_MEDIA=1         # D. consolidate media under Documents/         (moves)
+DO_TIDY=1          # E. loose files / empty stubs                  (tiny)
+DO_SHOWDOWN=1      # F. crystal-battle training data              ~36 GB
+DO_SHOWDOWN_LOGS=1 # F2 only: bench/*.log -- ON, ladder retired 2026-09-01  ~2.8 GB
+# -------------------------------------------------------------------------
+
+H=/home/wiz
+
+run() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '  [dry] %s\n' "$*"
+  else
+    printf '  [run] %s\n' "$*"
+    "$@"
+  fi
+}
+
+# rm -rf with a guard. A bad expansion must never become `rm -rf /` or
+# `rm -rf $HOME`, so the target has to sit strictly *inside* $H and carry a
+# non-trivial remainder. (Length checks don't work here -- "/home/wiz/go" is
+# a legitimate 12-char target.)
+zap() {
+  local p="$1" rest
+  case "$p" in
+    "$H"/?*) rest="${p#"$H"/}" ;;
+    *) echo "  !! refusing path outside $H: $p" >&2; return 1 ;;
+  esac
+  case "$rest" in
+    *..*|/*) echo "  !! refusing suspicious path: $p" >&2; return 1 ;;
+  esac
+  [[ -e "$p" ]] || { printf '  [skip] %s (already gone)\n' "$p"; return 0; }
+  run rm -rf -- "$p"
+}
+
+hdr() { printf '\n=== %s ===\n' "$*"; }
+
+# `|| true`: du exits nonzero on any unreadable path (e.g. the ~/phone mount),
+# which would otherwise trip set -e + pipefail before the script does anything.
+before=$(du -sh "$H" 2>/dev/null | cut -f1 || true)
+printf 'Home is currently: %s\n' "$before"
+[[ "$DRY_RUN" == "1" ]] && printf '\n*** DRY RUN -- nothing will be deleted. Re-run with DRY_RUN=0 ***\n'
+
+# =========================================================================
+# A. REGENERABLE CACHES
+# =========================================================================
+if [[ "$DO_CACHES" == "1" ]]; then
+  hdr "A. Regenerable caches (~79 GB)"
+
+  # paru AUR build cache, 53 GB. Holds every source tarball and built binary
+  # since April: 5x android-studio (25 GB), ~90x claude-code (21 GB).
+  # paru re-clones the PKGBUILD (a few KB) next time you build.
+  hdr "A1. paru clone cache (53 GB)"
+  if [[ -d "$H/.cache/paru/clone" ]]; then
+    for d in "$H"/.cache/paru/clone/*/; do
+      [[ -d "$d" ]] && zap "${d%/}"
+    done
+  fi
+
+  # Leftover build temp from the AIRI packaging job on 2026-07-12.
+  # AIRI is installed; these are throwaway extract dirs.
+  hdr "A2. stale Claude job temp (7.8 GB)"
+  zap "$H/.claude/jobs/b1f0eac6/tmp"
+
+  hdr "A3. language / tool caches (~19 GB)"
+  # `uv cache clean` and `pip cache purge` do the same thing; rm avoids
+  # depending on which venv is active.
+  zap "$H/.cache/uv"          # 12 GB
+  zap "$H/.cache/pip"         # 4.8 GB
+  zap "$H/.cache/npm"         # 708 MB  (npm's real cache; see B4)
+  zap "$H/.cache/go-build"    # 305 MB
+  zap "$H/.cache/go"          # 286 MB
+  zap "$H/.cache/node-gyp"    # 125 MB
+  zap "$H/.cache/zig"         # 56 MB
+  zap "$H/.cache/python"      # 1.3 GB
+  zap "$H/.triton/cache"      # 928 KB  GPU kernel cache, rebuilds on demand
+
+  hdr "A4. Firefox cache (1.6 GB)"
+  if pgrep -x firefox >/dev/null 2>&1; then
+    echo "  !! Firefox is RUNNING -- skipping. Close it and re-run this section."
+  else
+    zap "$H/.cache/mozilla"
+  fi
+
+  hdr "A5. Trash (125 MB, 347 items)"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "  [dry] empty $H/.local/share/Trash/{files,info}"
+  else
+    rm -rf "$H"/.local/share/Trash/files/* "$H"/.local/share/Trash/info/* 2>/dev/null || true
+    echo "  [run] trash emptied"
+  fi
+fi
+
+# =========================================================================
+# B. STALE PRE-XDG DUPLICATES
+#
+# .config/zsh/env.zsh moved these to XDG paths. Both copies exist; the old
+# ones have not been touched since April. Evidence per item below.
+# =========================================================================
+if [[ "$DO_STALE_XDG" == "1" ]]; then
+  hdr "B. Stale pre-XDG duplicate dirs (~5.9 GB)"
+
+  # env.zsh:104  CARGO_HOME=$XDG_DATA_HOME/cargo
+  #   ~/.local/share/cargo  mtime 2026-07-27   <- live
+  #   ~/.cargo              mtime 2026-04-24   <- dead
+  zap "$H/.cargo"     # 1.8 GB
+
+  # env.zsh:105  RUSTUP_HOME=$XDG_DATA_HOME/rustup
+  #   ~/.local/share/rustup/toolchains/stable-x86_64-unknown-linux-gnu  <- live
+  zap "$H/.rustup"    # 1.4 GB
+
+  # env.zsh:52  GOPATH=$XDG_DATA_HOME/go   (~/go/bin is empty; modules only)
+  #
+  # go/pkg/mod is written mode 0444 (dirs 0555) on purpose, so a plain
+  # `rm -rf` fails with "Permission denied" on every file. Restore write
+  # permission first. `go clean -modcache` would also work but targets the
+  # *current* GOPATH, which now points at ~/.local/share/go -- the wrong dir.
+  hdr "B3. stale ~/go (656 MB, read-only module cache)"
+  if [[ -d "$H/go" ]]; then
+    run chmod -R u+w "$H/go"
+    zap "$H/go"
+  fi
+
+  # `npm config get cache` -> /home/wiz/.cache/npm, so ~/.npm is orphaned.
+  zap "$H/.npm"       # 206 MB
+
+  # .zshenv  GNUPGHOME=$XDG_CONFIG_HOME/gnupg
+  #   ~/.config/gnupg  mtime 2026-07-28  <- live
+  #   ~/.gnupg         mtime 2026-04-24, private-keys-v1.d is EMPTY
+  # Archived first anyway, because it is key material. 96 KB.
+  hdr "B5. stale ~/.gnupg (archive, then remove)"
+  if [[ -d "$H/.gnupg" ]]; then
+    run tar czf "$H/Documents/gnupg-stale-20260728.tar.gz" -C "$H" .gnupg
+    zap "$H/.gnupg"
+  fi
+fi
+
+# =========================================================================
+# C. EXTRAS YOU SELECTED
+# =========================================================================
+if [[ "$DO_EXTRAS" == "1" ]]; then
+  hdr "C. Selected extras (~16 GB)"
+
+  # Re-downloads automatically on next use, but it is a slow refill.
+  zap "$H/.cache/huggingface"   # 14 GB
+
+  # AIRI is already installed from your local PKGBUILD (~/Developer/pkgbuilds).
+  zap "$H/Downloads/airi-bundled-bin-0.11.0-1-x86_64.pkg.tar"   # 1.9 GB
+fi
+
+# =========================================================================
+# D. MEDIA CONSOLIDATION -> Documents/
+#
+# Your two configs disagreed and the split was real:
+#   .zshenv            -> $HOME/Documents/{Pictures,Videos,Music}
+#   .config/user-dirs.dirs -> $HOME/{Pictures,Videos,Music}
+# Your tooling already assumes Documents/: hyprpaper.conf hardcodes
+# /home/wiz/Documents/Pictures/Backgrounds, and wallpaper / wallpaper-init /
+# rofi-wallpaper all default to $HOME/Documents/Pictures. So user-dirs.dirs
+# is the outlier and gets rewritten to match.
+# =========================================================================
+if [[ "$DO_MEDIA" == "1" ]]; then
+  hdr "D. Consolidate media under Documents/"
+
+  UD="$H/.config/user-dirs.dirs"
+
+  # True once all four keys this section owns already point where we want.
+  # grep -xF: whole line, literal -- the file contains a literal `$HOME`.
+  ud_consolidated() {
+    [[ -f "$UD" ]] || return 1
+    grep -qxF 'XDG_MUSIC_DIR="$HOME/Documents/Music"'       "$UD" &&
+    grep -qxF 'XDG_PICTURES_DIR="$HOME/Documents/Pictures"' "$UD" &&
+    grep -qxF 'XDG_VIDEOS_DIR="$HOME/Documents/Videos"'     "$UD" &&
+    grep -qxF 'XDG_PROJECTS_DIR="$HOME/Developer"'          "$UD"
+  }
+
+  if [[ ! -d "$H/Pictures" && ! -d "$H/Videos" && ! -d "$H/Music" ]] && ud_consolidated; then
+    echo "  [ok] already consolidated -- nothing to do"
+  elif pgrep -x wf-recorder >/dev/null 2>&1 || pgrep -x obs >/dev/null 2>&1; then
+    echo "  !! A recorder is RUNNING -- skip section D until it finishes."
+  else
+    for d in "$H/Documents/Pictures/Screenshots" "$H/Documents/Videos" "$H/Documents/Music"; do
+      [[ -d "$d" ]] || run mkdir -p "$d"
+    done
+
+    # Screenshots: merge, never clobber. Collisions are unlikely anyway since
+    # both sides use timestamp filenames.
+    if [[ -d "$H/Pictures/Screenshots" ]]; then
+      run rsync -a --ignore-existing "$H/Pictures/Screenshots/" "$H/Documents/Pictures/Screenshots/"
+      zap "$H/Pictures/Screenshots"
+    fi
+    [[ -d "$H/Pictures" ]] && run rmdir --ignore-fail-on-non-empty "$H/Pictures"
+
+    # Recordings (crystal-broadcast + airi-prism takes).
+    if [[ -d "$H/Videos" ]]; then
+      n=$(find "$H/Videos" -mindepth 1 -maxdepth 1 | wc -l)
+      if [[ "$n" -gt 0 ]]; then
+        sz=$(du -sh "$H/Videos" 2>/dev/null | cut -f1 || echo '?')
+        if [[ "$DRY_RUN" == "1" ]]; then
+          echo "  [dry] mv $H/Videos/* -> $H/Documents/Videos/  ($n entries, $sz)"
+        else
+          find "$H/Videos" -mindepth 1 -maxdepth 1 -exec mv -n -t "$H/Documents/Videos/" {} +
+          # mv -n refuses to clobber, so any subdir that already exists at the
+          # destination is left behind (this is what stranded ~/Videos/Screencaps
+          # on the 2026-07-28 run). Reap the ones that are empty on both sides.
+          find "$H/Videos" -mindepth 1 -type d -empty -delete
+        fi
+      fi
+      run rmdir --ignore-fail-on-non-empty "$H/Videos"
+    fi
+
+    [[ -d "$H/Music" ]] && run rmdir --ignore-fail-on-non-empty "$H/Music"
+
+    hdr "D2. reconcile .config/user-dirs.dirs"
+    if ud_consolidated; then
+      echo "  [ok] already points at Documents/ -- no change"
+    elif [[ "$DRY_RUN" == "1" ]]; then
+      echo "  [dry] set XDG_{MUSIC,PICTURES,VIDEOS}_DIR -> \$HOME/Documents/..."
+      echo "  [dry] set XDG_PROJECTS_DIR -> \$HOME/Developer"
+    else
+      bak="$UD.bak-$(date +%Y%m%d-%H%M%S)"
+      cp "$UD" "$bak"
+      sed -i \
+        -e 's|^XDG_MUSIC_DIR=.*|XDG_MUSIC_DIR="$HOME/Documents/Music"|' \
+        -e 's|^XDG_PICTURES_DIR=.*|XDG_PICTURES_DIR="$HOME/Documents/Pictures"|' \
+        -e 's|^XDG_VIDEOS_DIR=.*|XDG_VIDEOS_DIR="$HOME/Documents/Videos"|' \
+        -e 's|^XDG_PROJECTS_DIR=.*|XDG_PROJECTS_DIR="$HOME/Developer"|' \
+        "$UD"
+      echo "  [run] rewritten (backup: ${bak##*/})"
+    fi
+  fi
+fi
+
+# =========================================================================
+# E. LOOSE FILES AND EMPTY STUBS
+# =========================================================================
+if [[ "$DO_TIDY" == "1" ]]; then
+  hdr "E. Loose files and empty stubs"
+
+  # Already installed system-wide as
+  # /etc/systemd/system/NetworkManager.service.d/10-iwd-ordering.conf
+  # so the home copy is a leftover staging file.
+  zap "$H/iwd-ordering.conf"
+
+  # Referenced by your Claude memory as ~/gemma-writing-setup.md.
+  # If you move it, say so and the memory pointer gets updated too.
+  echo "  [note] ~/gemma-writing-setup.md left in place (memory references this path)."
+  # run mv "$H/gemma-writing-setup.md" "$H/Documents/gemma-writing-setup.md"
+
+  # Empty XDG stubs. Desktop is kept -- some apps expect it to exist.
+  for d in Public Templates Projects; do
+    [[ -d "$H/$d" ]] && run rmdir --ignore-fail-on-non-empty "$H/$d"
+  done
+
+  # NOT touched, deliberately:
+  #   ~/.github   -- 21 MB, but TRACKED by the .dotfiles bare repo
+  #                  (worktree=$HOME). It is the RumpusDots README +
+  #                  screenshots. Deleting it would stage a deletion.
+  #   ~/phone     -- MTP mount point for the Galaxy S22.
+  #   ~/.var      -- flatpak data for Blender + Godot (both in active use).
+  #   ~/.todo.git -- local-only bare repo behind TODO.md / DONE.md.
+fi
+
+# =========================================================================
+# F. CRYSTAL-BATTLE TRAINING DATA  -- OFF BY DEFAULT, READ FIRST
+#
+# Nothing here is in git (*.pkl is gitignored) and nothing is recoverable
+# once deleted. Set DO_SHOWDOWN=1 only after you have decided.
+# =========================================================================
+if [[ "$DO_SHOWDOWN" == "1" ]]; then
+  hdr "F. crystal-battle/showdown (~41 GB)"
+  S="$H/Developer/grimoire/crystal-battle/showdown"
+
+  # F1 -- 30 GB. Derived feature tensors, regenerable from
+  # gen9ou_policy_human.pkl by re-running the featurizer. Costs CPU time,
+  # not data. Biggest single win in the whole home dir.
+  zap "$S/policy_feats/human_v1.X.npy"
+
+  # F2 -- bench logs. Held back on 2026-07-28 because crystal-ladder.service
+  # was mid-series; the nightly ladder automation was retired on 2026-09-01
+  # (units and the `ladder` CLI deleted), so this is now enabled.
+  #
+  # NOTE the cutoff below is still the original 2026-07-24 and has gone stale.
+  # Measured 2026-09-01: 2.8 GB / 1231 files predate it and will be removed,
+  # but 9.8 GB / 1558 files have accumulated since and are NOT touched
+  # (bench/ is 13 GB total). Move the -newermt date forward to reclaim those.
+  # The pgrep guard is kept: harmless now, and correct if a run is ever
+  # started by hand.
+  if [[ "$DO_SHOWDOWN_LOGS" == "1" ]]; then
+    if pgrep -f 'overnight_ladder|gen9_player' >/dev/null 2>&1; then
+      echo "  !! ladder still running -- refusing to touch bench logs."
+    elif [[ "$DRY_RUN" == "1" ]]; then
+      echo "  [dry] delete bench/*.log older than 2026-07-24 (keeps recent runs)"
+    else
+      find "$S/bench" -name '*.log' ! -newermt '2026-07-24' -delete
+      echo "  [run] pre-Jul-24 bench logs removed"
+    fi
+  else
+    echo "  [skip] bench logs held back (DO_SHOWDOWN_LOGS=0)"
+  fi
+
+  # F3 -- 6.2 GB, 15 files from the May self-play distill line that your
+  # notes record as refuted (data-scaling capped ~+7.6pp, peer AZ round-1
+  # regressed -18.7pp, pivoted to real-Showdown).
+  for f in gen9_mix_fresh_replays_v2.pkl gen9_mix_fresh_replays.pkl \
+           gen9_selfplay_fresh.pkl gen9_selfplay_data_2k.pkl \
+           gen9_selfplay_az.pkl gen9_selfplay_bo_3s.pkl \
+           gen9_selfplay_strong.pkl gen9_selfplay_bo_3s_r1.pkl \
+           gen9_selfplay_bo_3s_r2.pkl gen9_selfplay_polidist.pkl \
+           gen9_selfplay_bo.pkl gen9ou_replay_data_v2.pkl \
+           gen9ou_distill_data.pkl gen9ou_replay_data.pkl \
+           gen9_selfplay_data.pkl; do
+    zap "$S/$f"
+  done
+fi
+
+# =========================================================================
+hdr "Done"
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "Dry run only. Re-run with:  DRY_RUN=0 $0"
+else
+  after=$(du -sh "$H" 2>/dev/null | cut -f1 || true)
+  printf 'Home was %s, now %s\n' "$before" "$after"
+fi
