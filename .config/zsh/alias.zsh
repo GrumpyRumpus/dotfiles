@@ -9,7 +9,9 @@ alias refreshenv="source $ZDOTDIR/.zshrc"
 alias c=clear
 alias rf="refreshenv && c"
 alias e=$EDITOR
-alias svim='sudo -E HOME="$HOME" nvim'
+# edit root-owned files as yourself; sudoedit writes the result back as root
+# (running nvim under sudo leaves root-owned files in ~/.local/share/nvim)
+alias svim='sudoedit'
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Listing (eza)

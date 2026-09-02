@@ -36,6 +36,10 @@ apply_waybar() {
     local theme_config="$GENERATED_DIR/$theme/waybar-config.jsonc"
     if [[ -f "$theme_config" ]]; then
         cp "$theme_config" "$HOME/.config/waybar/config.jsonc"
+        # The theme config carries a static single-monitor default, so re-apply
+        # the monitor-aware persistent-workspaces it just overwrote
+        local monitors="$HOME/.config/hypr/scripts/handle-monitors.sh"
+        [[ -x "$monitors" ]] && command -v hyprctl &>/dev/null && "$monitors" --waybar-only
         applied=true
     fi
 
