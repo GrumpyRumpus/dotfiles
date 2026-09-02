@@ -117,6 +117,72 @@ session/
 !.claude/statusline*.sh
 
 # ============================================================================
+# THEME-SYSTEM OUTPUT (regenerate with `theme set`)
+# ============================================================================
+# Generated from the tracked palettes/templates under .config/themes/.
+# Files already tracked here (the legacy catppuccin-mocha* variants) stay
+# tracked; use `git add -f` if a new file in these dirs is real config.
+.config/Kvantum/*/
+.config/bat/themes/
+.config/fsh/
+.config/themes/current/
+.config/themes/.current
+.config/themes/generated/
+.config/qt5ct/colors/current.conf
+.config/qt6ct/colors/current.conf
+.config/spotify-player/theme.toml
+.config/hypr/appearance/hyprlock-colors.conf
+.config/dunst/icons/
+
+# ============================================================================
+# APP STATE, DATA AND BIG DIRS
+# ============================================================================
+.local/share/
+.cmake/
+.triton/
+.texlive/
+.ollama/
+.var/
+.vite-plus/
+.supabase/
+.themes/
+.config/dconf/
+.config/pulse/
+.config/go/
+.config/blender/
+.config/inkscape/
+.config/aseprite/
+.config/waypaper/
+.config/mozilla/
+.config/ai.moeru.airi/
+.config/org.coolercontrol.CoolerControl/
+.config/user-dirs.locale
+# Enable-state symlinks are per-machine; the unit files themselves are tracked.
+.config/systemd/user/*.target.wants/
+# Content dirs, not config.
+Developer/
+Documents/
+Downloads/
+Games/
+csakura/
+team-tools/
+gpu-watch/
+bookmark-triage-output/
+watch_[0-9]*/
+# These have their own repos.
+.dotfiles/
+.todo.git/
+TODO.md
+DONE.md
+
+# ============================================================================
+# STALE BACKUPS (the *.bak rule above misses these shapes)
+# ============================================================================
+*.bak-*
+*.obsolete
+*.pre-igpu-only
+
+# ============================================================================
 # ALLOW ESSENTIAL DOTFILES
 # ============================================================================
 !.gitignore
