@@ -104,5 +104,6 @@
     "mauve",
     "pink"
   ],
-  "cursor": "Adwaita"
+  "cursor": "Adwaita",
+  "shader": "~/.config/hypr/shaders/crt.frag"
 }

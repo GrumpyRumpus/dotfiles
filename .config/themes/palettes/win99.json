@@ -93,5 +93,6 @@
     "stream",
     "electric",
     "angel"
-  ]
+  ],
+  "shader": "~/.config/hypr/shaders/crt.frag"
 }

@@ -135,6 +135,33 @@ export THEME_DESCRIPTION="${THEME_DESCRIPTION:-$THEME_NAME theme}"
 # match the theme (e.g. catppuccin -> catppuccin-mocha-dark-cursors).
 CURSOR_THEME=$(jq -r '.cursor // empty' "$PALETTE_FILE")
 export CURSOR_THEME="${CURSOR_THEME:-$THEME_NAME-cursors}"
+export CURSOR_SIZE=$(jq -r '.cursor_size // 24' "$PALETTE_FILE")
+
+# Relative luminance (ITU-R BT.709) of #rrggbb, as 0-1000.
+color_luminance() {
+    local hex="${1#\#}"
+    local r=$((16#${hex:0:2})) g=$((16#${hex:2:2})) b=$((16#${hex:4:2}))
+    echo $(( (2126 * r + 7152 * g + 722 * b) / 2550 ))
+}
+
+# Icon set follows the palette background -- a light base needs the light
+# Papirus variant or the icons vanish into it. Override per palette with
+# .icon_theme. This reproduces every hand-written choice across the 16 themes.
+GTK_ICON_THEME=$(jq -r '.icon_theme // empty' "$PALETTE_FILE")
+if [[ -z "$GTK_ICON_THEME" ]]; then
+    _base=$(jq -r '.colors.base // "#000000"' "$PALETTE_FILE")
+    if [[ $(color_luminance "$_base") -gt 500 ]]; then
+        GTK_ICON_THEME="Papirus-Light"
+    else
+        GTK_ICON_THEME="Papirus-Dark"
+    fi
+fi
+export GTK_ICON_THEME
+
+# Optional, inert metadata: nothing reads these yet, but theme.conf has always
+# carried them and build-catppuccin-retheme.sh expects the file to exist.
+export THEME_SHADER=$(jq -r '.shader // empty' "$PALETTE_FILE")
+export QT_COLOR_SCHEME=$(jq -r '.qt_color_scheme // empty' "$PALETTE_FILE")
 
 # Get MODULE_FG values for contrast calculation
 MODULE_FG="${COLORS[module_fg]}"
@@ -199,7 +226,7 @@ else
 fi
 
 # Build list of variables to substitute
-VARS='$THEME_NAME $THEME_DESCRIPTION $CURSOR_THEME'
+VARS='$THEME_NAME $THEME_DESCRIPTION $CURSOR_THEME $CURSOR_SIZE $GTK_ICON_THEME $THEME_SHADER $QT_COLOR_SCHEME'
 
 # Add all color variables (uppercase versions)
 for key in "${!COLORS[@]}"; do
@@ -241,6 +268,16 @@ for template in "$TEMPLATES_DIR"/*.tmpl; do
             # Use override file directly (still run envsubst for color variables)
             echo "  -> $filename (override)"
             envsubst "$VARS" < "$override" > "$output"
+
+            # Overrides replace the template wholesale, so any variable added to
+            # the template later is simply absent here -- and Hyprland only
+            # complains at apply time, per missing variable. Flag the drift.
+            missing=$(comm -23 \
+                <(grep -oP '^\$\K[a-zA-Z_0-9]+(?=\s*=)' "$template" 2>/dev/null | sort -u) \
+                <(grep -oP '^\$\K[a-zA-Z_0-9]+(?=\s*=)' "$override" 2>/dev/null | sort -u))
+            if [[ -n "$missing" ]]; then
+                echo "     WARNING: $filename override is missing $(echo "$missing" | wc -l) var(s) the template defines: $(echo $missing | tr '\n' ' ')" >&2
+            fi
         else
             # Use template
             echo "  -> $filename"
