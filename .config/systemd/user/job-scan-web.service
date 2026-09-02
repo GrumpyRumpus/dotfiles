@@ -1,0 +1,16 @@
+[Unit]
+Description=job-scan dashboard web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Developer/job-scan
+ExecStart=%h/Developer/job-scan/serve.sh
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

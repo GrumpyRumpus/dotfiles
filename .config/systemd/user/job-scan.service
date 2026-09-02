@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily job posting scan against resume
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/job-scan
+ExecStart=%h/Developer/job-scan/run.sh
+# Make notify-send able to reach the user session
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+StandardOutput=journal
+StandardError=journal

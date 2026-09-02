@@ -1,0 +1,12 @@
+[Unit]
+Description=grounded-rag API (Pokemon expert) on 127.0.0.1:8001
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/wiz/Developer/grounded-rag
+ExecStart=/home/wiz/Developer/grounded-rag/.venv/bin/uvicorn --app-dir api main:app --host 127.0.0.1 --port 8001
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

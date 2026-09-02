@@ -1,0 +1,16 @@
+[Unit]
+Description=Weekly job scan incl. hiring-without-whiteboards companies
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/job-scan
+ExecStart=%h/Developer/job-scan/weekly.sh
+# Make notify-send able to reach the user session
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+# The resolve step fetches ~800 pages; give it room.
+TimeoutStartSec=3600
+StandardOutput=journal
+StandardError=journal
