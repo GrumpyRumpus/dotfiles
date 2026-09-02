@@ -1,6 +1,6 @@
 {
   "label":            "lock",
-  "action":           "swaylock",
+  "action":           "$HOME/.local/bin/hyprlock-logged",
   "text":             "Lock",
   "keybind":          "l"
 }
@@ -24,7 +24,7 @@
 }
 {
   "label":            "suspend",
-  "action":           "swaylock -f && systemctl suspend",
+  "action":           "$HOME/.local/bin/hyprlock-logged & for _ in $(seq 30); do hyprctl locked | grep -q true && break; sleep 0.1; done; systemctl suspend",
   "text":             "Suspend",
   "keybind":          "u"
 }
