@@ -57,6 +57,10 @@ $g7 = rgb(${GRADIENT_7_NOHASH})
 $g8 = rgb(${GRADIENT_8_NOHASH})
 $g9 = rgb(${GRADIENT_9_NOHASH})
 
+# Cursor theme
+$cursor_theme = ${CURSOR_THEME}
+$cursor_size = 24
+
 # Style variables — Win99
 $theme_rounding = ${STYLE_CORNER_RADIUS}
 $theme_border_size = 4
