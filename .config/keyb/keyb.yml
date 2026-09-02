@@ -1,0 +1,4 @@
+- name: example
+  keybinds:
+  - name: add your keys in
+    key: /home/wiz/.config/keyb/keyb.yml
