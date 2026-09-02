@@ -1,0 +1,13 @@
+[Unit]
+Description=Mirror the Hyprland log to ~/.local/state for post-freeze forensics
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hyprland-log-persist
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target

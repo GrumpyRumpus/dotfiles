@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# hyprland-log-persist: mirror Hyprland's log out of $XDG_RUNTIME_DIR into
+# ~/.local/state/hyprland. The runtime copy dies with the session, so a freeze,
+# a bad resume or a compositor wedge leaves nothing to read afterwards.
+set -uo pipefail
+
+DEST_DIR="${HYPRLAND_LOG_DIR:-$HOME/.local/state/hyprland}"
+KEEP="${HYPRLAND_LOG_KEEP:-8}"
+WAIT="${HYPRLAND_LOG_WAIT:-120}"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr"
+
+mkdir -p "$DEST_DIR"
+
+# Hyprland creates its instance dir a moment after login, so wait for it rather
+# than racing the compositor and exiting.
+src=
+for ((i = 0; i < WAIT; i++)); do
+    src=$(ls -1dt "$RUNTIME"/*/hyprland.log 2>/dev/null | head -1)
+    [[ -n $src ]] && break
+    sleep 1
+done
+[[ -n $src ]] || {
+    echo "hyprland-log-persist: no hyprland.log under $RUNTIME after ${WAIT}s" >&2
+    exit 1
+}
+
+dest="$DEST_DIR/$(basename "$(dirname "$src")").log"
+
+# A restart mid-session must not replay lines already mirrored. tail -F can also
+# leave the mirror ending mid-line, so break the line before the next marker.
+if [[ -s $dest ]]; then
+    from=(-n 0)
+    printf '\n' >>"$dest"
+else
+    from=(-n +1)
+fi
+
+printf '===== %s mirroring %s =====\n' "$(date -Is)" "$src" >>"$dest"
+
+# Prune old sessions only after the current one exists, so it is never the
+# newest-but-one and never a deletion candidate.
+ls -1dt "$DEST_DIR"/*.log 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+
+tail "${from[@]}" -F "$src" >>"$dest" &
+tailpid=$!
+trap 'kill "$tailpid" 2>/dev/null' EXIT INT TERM
+
+# A compositor restart builds a new instance dir and orphans this one, so stop
+# following a dead path and let systemd restart us onto the current session.
+while kill -0 "$tailpid" 2>/dev/null && [[ -e $src ]]; do
+    sleep 10
+done
