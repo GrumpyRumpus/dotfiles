@@ -121,9 +121,10 @@ apply_stylus() {
 
     [[ ! -d "$stylus_dir" ]] && { report_skip "stylus (no styles)"; return; }
 
-    # Copy to current for easy access
+    # Copy to current for easy access, incl. the single-file importable bundle
     if copy_to_current "$theme" "stylus"; then
-        report_ok "stylus (import from $CURRENT_DIR/stylus/)"
+        copy_to_current "$theme" "stylus-bundle.json" >/dev/null 2>&1
+        report_ok "stylus (import $CURRENT_DIR/stylus-bundle.json)"
     else
         report_skip "stylus"
     fi
