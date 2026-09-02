@@ -30,7 +30,11 @@ DO_EXTRAS=1        # C. huggingface cache + AIRI pkg (you chose)  ~16 GB
 DO_MEDIA=1         # D. consolidate media under Documents/         (moves)
 DO_TIDY=1          # E. loose files / empty stubs                  (tiny)
 DO_SHOWDOWN=1      # F. crystal-battle training data              ~36 GB
-DO_SHOWDOWN_LOGS=1 # F2 only: bench/*.log -- ON, ladder retired 2026-09-01  ~2.8 GB
+DO_SHOWDOWN_LOGS=1 # F2 only: bench/*.log -- ON, ladder retired 2026-09-01
+# Retention window for F2, in days. Relative on purpose: the previous hardcoded
+# '2026-07-24' cutoff silently went stale and by 2026-09-01 was pruning only
+# 2.8 GB of a 13 GB directory. Override per-run: BENCH_KEEP_DAYS=45 home-cleanup
+BENCH_KEEP_DAYS="${BENCH_KEEP_DAYS:-30}"
 # -------------------------------------------------------------------------
 
 H=/home/wiz
@@ -308,20 +312,22 @@ if [[ "$DO_SHOWDOWN" == "1" ]]; then
   # was mid-series; the nightly ladder automation was retired on 2026-09-01
   # (units and the `ladder` CLI deleted), so this is now enabled.
   #
-  # NOTE the cutoff below is still the original 2026-07-24 and has gone stale.
-  # Measured 2026-09-01: 2.8 GB / 1231 files predate it and will be removed,
-  # but 9.8 GB / 1558 files have accumulated since and are NOT touched
-  # (bench/ is 13 GB total). Move the -newermt date forward to reclaim those.
+  # Prunes anything older than BENCH_KEEP_DAYS (default 30).
+  # Measured 2026-09-01: the corpus runs 2026-07-11..2026-08-14, 12.6 GB total,
+  # with nothing newer than Aug 14. At 30 days that drops July (~6.3 GB, 2020
+  # files) and keeps Aug 2 onward (~5.9 GB). NOTE these logs are inputs to
+  # loss_trace.py, stall_audit.py, scouting_book.py, decompose_game_time.py and
+  # the *_ab.sh drivers -- deleting them removes those tools' source data.
   # The pgrep guard is kept: harmless now, and correct if a run is ever
   # started by hand.
   if [[ "$DO_SHOWDOWN_LOGS" == "1" ]]; then
     if pgrep -f 'overnight_ladder|gen9_player' >/dev/null 2>&1; then
       echo "  !! ladder still running -- refusing to touch bench logs."
     elif [[ "$DRY_RUN" == "1" ]]; then
-      echo "  [dry] delete bench/*.log older than 2026-07-24 (keeps recent runs)"
+      echo "  [dry] delete bench/*.log older than ${BENCH_KEEP_DAYS}d ($(find "$S/bench" -name '*.log' -mtime +"$BENCH_KEEP_DAYS" 2>/dev/null | wc -l) files)"
     else
-      find "$S/bench" -name '*.log' ! -newermt '2026-07-24' -delete
-      echo "  [run] pre-Jul-24 bench logs removed"
+      find "$S/bench" -name '*.log' -mtime +"$BENCH_KEEP_DAYS" -delete
+      echo "  [run] bench logs older than ${BENCH_KEEP_DAYS}d removed"
     fi
   else
     echo "  [skip] bench logs held back (DO_SHOWDOWN_LOGS=0)"
