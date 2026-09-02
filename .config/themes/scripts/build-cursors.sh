@@ -8,17 +8,44 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THEMES_DIR="$(dirname "$SCRIPT_DIR")"
 PALETTES_DIR="$THEMES_DIR/palettes"
 CURSOR_OUTPUT_DIR="$HOME/.local/share/icons"
-SVG_SRC_DIR="/tmp/catppuccin-cursors/src/svgs"
-BUILD_DIR="/tmp/cursor-build"
+# Source and scratch live under the cache, NOT /tmp: /tmp is tmpfs, so a reboot
+# wipes the clone, and the next build renders nothing while still creating the
+# alias symlinks -- every theme silently becomes 33 dangling links.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/theme-cursors"
+CURSOR_SRC_DIR="$CACHE_DIR/catppuccin-cursors"
+SVG_SRC_DIR="$CURSOR_SRC_DIR/src/svgs"
+BUILD_DIR="$CACHE_DIR/build"
 
 # Cursor sizes to render
 SIZES=(24 32 48 64 72)
 
-# Clone source repo if not present
+# Fetch the SVG source, once, and prove it is usable before anything renders.
+#
+# generate-theme.sh calls this script per theme and regenerate-all.sh fans those
+# out in parallel, so without the lock 16 clones race into one directory and
+# leave it half-written. Failures here are fatal on purpose: exiting 0 with no
+# SVGs is what silently produced empty cursor themes.
 clone_source() {
-    if [[ ! -d "/tmp/catppuccin-cursors" ]]; then
-        echo "Cloning catppuccin cursors source..."
-        git clone --depth 1 https://github.com/catppuccin/cursors.git /tmp/catppuccin-cursors 2>/dev/null
+    mkdir -p "$CACHE_DIR"
+
+    exec 9>"$CACHE_DIR/.clone.lock"
+    flock 9
+
+    if [[ ! -d "$CURSOR_SRC_DIR/.git" ]]; then
+        echo "Cloning catppuccin cursors source into $CURSOR_SRC_DIR..."
+        rm -rf "$CURSOR_SRC_DIR"
+        if ! git clone --depth 1 https://github.com/catppuccin/cursors.git "$CURSOR_SRC_DIR"; then
+            echo "Error: failed to clone the cursor SVG source" >&2
+            rm -rf "$CURSOR_SRC_DIR"
+            exit 1
+        fi
+    fi
+
+    flock -u 9
+
+    if ! compgen -G "$SVG_SRC_DIR/*.svg" >/dev/null; then
+        echo "Error: no SVGs under $SVG_SRC_DIR -- refusing to build empty cursor themes" >&2
+        exit 1
     fi
 }
 
@@ -105,6 +132,29 @@ generate_xcursor_config() {
     done
 }
 
+# Animated shapes ship as per-frame SVGs (wait-01.svg .. wait-12.svg). One
+# Xcursor file holds every frame: repeat the size with a trailing ms delay,
+# frames in order. FRAME_TIME matches upstream catppuccin's build.
+FRAME_TIME=30
+
+generate_animated_xcursor_config() {
+    local png_dir="$1"
+    local base_name="$2"
+    local config_file="$3"
+    local hotspot_x="${4:-0}"
+    local hotspot_y="${5:-0}"
+
+    > "$config_file"
+    for size in "${SIZES[@]}"; do
+        local xhot=$((size * hotspot_x / 100))
+        local yhot=$((size * hotspot_y / 100))
+        local frame
+        for frame in $(ls "$png_dir/${base_name}"-[0-9]*_"${size}".png 2>/dev/null | sort); do
+            echo "$size $xhot $yhot $frame $FRAME_TIME" >> "$config_file"
+        done
+    done
+}
+
 # Build cursor theme for a palette
 build_cursor_theme() {
     local palette_file="$1"
@@ -184,23 +234,40 @@ build_cursor_theme() {
         ["zoom-out"]="50 50"
     )
 
+    local -A built_animated=()
     for svg in "$svg_dir"/*.svg; do
-        local name config
+        local name config out_name
         name=$(basename "$svg" .svg)
 
-        # Handle animated cursors (progress-*, wait-*)
-        local base_name="${name%-[0-9]*}"
+        # Animated cursors (progress-01 .. wait-12) collapse to one output per
+        # base name. Writing per frame leaves `wait`/`progress` nonexistent and
+        # their aliases (watch, left_ptr_watch, half-busy) dangling.
+        local base_name="${name%-[0-9][0-9]}"
+        local animated=false
+        [[ "$base_name" != "$name" ]] && animated=true
+
+        if $animated; then
+            [[ -n "${built_animated[$base_name]:-}" ]] && continue
+            built_animated[$base_name]=1
+            out_name="$base_name"
+        else
+            out_name="$name"
+        fi
 
         # Get hotspot
         local hotspot="${HOTSPOTS[$base_name]:-6 3}"
         local hx="${hotspot%% *}"
         local hy="${hotspot##* }"
 
-        config="/tmp/xcursor-$name.conf"
-        generate_xcursor_config "$png_dir" "$name" "$config" "$hx" "$hy"
+        config="$work_dir/xcursor-$out_name.conf"
+        if $animated; then
+            generate_animated_xcursor_config "$png_dir" "$base_name" "$config" "$hx" "$hy"
+        else
+            generate_xcursor_config "$png_dir" "$name" "$config" "$hx" "$hy"
+        fi
 
         if [[ -s "$config" ]]; then
-            xcursorgen "$config" "$output_theme/cursors/$name" 2>/dev/null || true
+            xcursorgen "$config" "$output_theme/cursors/$out_name" 2>/dev/null || true
         fi
         rm -f "$config"
     done
@@ -317,6 +384,9 @@ Inherits=default
 EOF
 
     echo "  Installed to $output_theme"
+
+    # This build's scratch only -- see the cleanup note in main().
+    rm -rf "$work_dir"
 }
 
 # Main
@@ -355,8 +425,10 @@ main() {
         done
     fi
 
-    # Cleanup
-    rm -rf "$BUILD_DIR"
+    # Cleanup. Only drop the shared parent if nothing else is still using it --
+    # concurrent builds each own a $BUILD_DIR/<theme> subdir, and wiping the
+    # parent here deleted their in-progress PNGs mid-render.
+    rmdir --ignore-fail-on-non-empty "$BUILD_DIR" 2>/dev/null || true
 
     echo ""
     echo "=== Done ==="
