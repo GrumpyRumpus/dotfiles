@@ -1,0 +1,66 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(python3 -m py_compile *)",
+      "Bash(systemctl --user list-timers *)",
+      "Bash(systemctl list-timers *)",
+      "Bash(systemctl --user is-active *)",
+      "Bash(systemctl --user status *)",
+      "Bash(systemctl --user cat *)",
+      "Bash(pacman -Qo *)",
+      "Bash(pacman -Qi *)"
+    ]
+  },
+  "model": "opus[1m]",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/enforce-longrun-wrap.sh",
+            "timeout": 10,
+            "statusMessage": "Checking long-run wrap..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/enforce-todo-done-split.sh",
+            "timeout": 10,
+            "statusMessage": "Checking TODO/DONE split..."
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline-current.sh"
+  },
+  "enabledPlugins": {
+    "pyright-lsp@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": false,
+    "feature-dev@claude-plugins-official": false,
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "effortLevel": "xhigh",
+  "modelSettings": {
+    "claude-fable-5": {
+      "effortLevel": "xhigh"
+    },
+    "claude-opus-5": {
+      "effortLevel": "high"
+    }
+  },
+  "tui": "fullscreen",
+  "skipWorkflowUsageWarning": true,
+  "theme": "dark-ansi"
+}
