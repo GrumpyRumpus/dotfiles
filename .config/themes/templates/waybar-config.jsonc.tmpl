@@ -94,20 +94,7 @@
     "on-scroll-up": "~/.config/waybar/scripts/workspace-scroll.sh up",
     "on-scroll-down": "~/.config/waybar/scripts/workspace-scroll.sh down",
     "persistent-workspaces": {
-      "eDP-1": [
-        1,
-        3,
-        5,
-        7,
-        9
-      ],
-      "HDMI-A-1": [
-        2,
-        4,
-        6,
-        8,
-        10
-      ]
+      "eDP-1": [1, 2, 3, 4, 5]
     },
     "sort-by-number": true,
     "tooltip": false
@@ -146,13 +133,13 @@
       "Godot Engine - (.*)": "<span foreground='#478cbf'> </span> $1",
       "(.*) - Godot Engine": "<span foreground='#478cbf'> </span> $1",
       // office
-      "Office": "<span foreground='${RED}'> </span> Desktop Editor",
+      "Office": "<span foreground='${ANSI_RED}'> </span> Desktop Editor",
       "(.*).docx": "<span foreground='#2b579a'> </span> $1.docx",
       "(.*).xlsx": "<span foreground='#217346'> </span> $1.xlsx",
       "(.*).pptx": "<span foreground='#d24726'> </span> $1.pptx",
-      "(.*).pdf": "<span foreground='${RED}'> </span> $1.pdf",
+      "(.*).pdf": "<span foreground='${ANSI_RED}'> </span> $1.pdf",
       // file manager
-      "/": "<span foreground='${YELLOW}'> </span> File Manager",
+      "/": "<span foreground='${ANSI_YELLOW}'> </span> File Manager",
       // images
       "(.*).jpg": "<span foreground='${FT_MEDIA}'>󰈟 </span> $1.jpg",
       "(.*).png": "<span foreground='${FT_MEDIA}'>󰈟 </span> $1.png",
