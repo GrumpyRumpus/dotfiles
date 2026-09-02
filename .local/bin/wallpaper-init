@@ -1,37 +1,16 @@
 #!/bin/bash
-# Start the awww wallpaper daemon and restore the last wallpaper at login.
+# Bring up the wallpaper. The daemon itself lives in awww-daemon.service so it
+# survives the terminal that launched it and is restarted when a wl_output
+# teardown kills it; this script is just the entry point that starts it.
 #
-# awww-daemon caches the last displayed image and restores it on start, but we
-# call `awww restore` explicitly (and fall back to the saved pointer) so a
-# cold cache still comes up with a wallpaper instead of a black screen.
+# The daemon is deliberately NOT spawned here any more. Having a bare
+# awww-daemon and a supervised one both bound to the background layer is worse
+# than having neither.
 
 set -u
 
-# awww owns the background layer; make sure hyprpaper isn't also running.
-pkill -x hyprpaper 2>/dev/null
+systemctl --user start awww-daemon.service || exit 1
 
-if ! pgrep -x awww-daemon >/dev/null; then
-    awww-daemon >/dev/null 2>&1 &
-fi
-
-# Wait for the daemon to accept IPC (up to ~10s).
-for _ in $(seq 1 50); do
-    awww query >/dev/null 2>&1 && break
-    sleep 0.2
-done
-
-# Restore the cached image; if nothing is displayed, set the saved one.
-awww restore >/dev/null 2>&1
-if ! awww query 2>/dev/null | grep -q 'displaying: image:'; then
-    img="$(readlink -f "$HOME/.cache/current_wallpaper" 2>/dev/null)"
-    if [[ ! -f "$img" && -f "$HOME/.cache/wal/wal" ]]; then
-        img="$(cat "$HOME/.cache/wal/wal" 2>/dev/null)"
-    fi
-    if [[ ! -f "$img" ]]; then
-        dir="${XDG_PICTURES_DIR:-$HOME/Documents/Pictures}/Backgrounds"
-        img="$(find -L "$dir" -maxdepth 1 -type f \
-            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) \
-            2>/dev/null | head -1)"
-    fi
-    [[ -f "$img" ]] && awww img "$img" --transition-type none >/dev/null 2>&1
-fi
+# The unit's ExecStartPost already restores, but run it again so calling this
+# script against an already-running daemon re-applies the wallpaper.
+exec "$HOME/.local/bin/wallpaper-restore"

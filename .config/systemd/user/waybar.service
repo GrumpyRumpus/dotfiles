@@ -1,0 +1,20 @@
+# Full replacement for /usr/lib/systemd/user/waybar.service.
+# The packaged unit has Requisite=graphical-session.target, and that target
+# never activates in this uwsm session, so it refuses to start. A drop-in can
+# override Restart= but could not reset the inherited Requisite=, so this
+# shadows the packaged unit entirely.
+[Unit]
+Description=Waybar (supervised)
+Documentation=https://github.com/Alexays/Waybar/wiki/
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/waybar
+ExecReload=kill -SIGUSR2 $MAINPID
+# A wl_output teardown kills waybar with a Wayland protocol error; come back
+# from that as well as from a clean exit.
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=awww wallpaper daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/awww-daemon
+ExecStartPost=%h/.local/bin/wallpaper-restore
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

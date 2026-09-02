@@ -1,0 +1,37 @@
+#!/bin/bash
+# Restore the last wallpaper into an already-running awww-daemon.
+#
+# Split out of wallpaper-init so the daemon itself can be supervised by
+# awww-daemon.service. This script never spawns a daemon: two of them fighting
+# over the background layer is worse than having none.
+
+set -u
+
+# awww owns the background layer; make sure hyprpaper isn't also running.
+pkill -x hyprpaper 2>/dev/null
+
+# Wait for the daemon to accept IPC (up to ~10s).
+for _ in $(seq 1 50); do
+    awww query >/dev/null 2>&1 && break
+    sleep 0.2
+done
+
+# Restore the cached image; if nothing is displayed, set the saved one.
+awww restore >/dev/null 2>&1
+if ! awww query 2>/dev/null | grep -q 'displaying: image:'; then
+    img="$(readlink -f "$HOME/.cache/current_wallpaper" 2>/dev/null)"
+    if [[ ! -f "$img" && -f "$HOME/.cache/wal/wal" ]]; then
+        img="$(cat "$HOME/.cache/wal/wal" 2>/dev/null)"
+    fi
+    if [[ ! -f "$img" ]]; then
+        dir="${XDG_PICTURES_DIR:-$HOME/Documents/Pictures}/Backgrounds"
+        img="$(find -L "$dir" -maxdepth 1 -type f \
+            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) \
+            2>/dev/null | head -1)"
+    fi
+    [[ -f "$img" ]] && awww img "$img" --transition-type none >/dev/null 2>&1
+fi
+
+# Never fail the unit: this runs as ExecStartPost, and a non-zero exit would
+# put awww-daemon.service into a restart loop.
+exit 0
