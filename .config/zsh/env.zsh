@@ -9,6 +9,7 @@ export TERMINAL=kitty
 export BROWSER=firefox
 export VISUAL=nvim
 export EDITOR=nvim
+export SUDO_EDITOR=nvim
 export LESS="-Ss~ --ignore-case --LONG-PROMPT --quit-if-one-screen --RAW-CONTROL-CHARS --use-color"
 
 # ══════════════════════════════════════════════════════════════════════════════
